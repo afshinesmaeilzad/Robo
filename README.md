@@ -73,7 +73,7 @@ About the voltages:
 - **Never** connect a battery to the ESP32-CAM **3.3V** pin. That bypasses the regulator and damages the board.
 - A **470–1000 µF capacitor** across the ESP32-CAM's 5V and GND (+ to 5V) covers the short current bursts and helps a lot on batteries.
 - The L293D loses about 1.5–2V internally, so from 6V the TT motors get roughly 4V. That's fine for a small robot.
-- WiFi draws current in bursts, up to about 300 mA. The sketch keeps this down: 80 MHz CPU, reduced WiFi transmit power, soft motor start, and no video unless you ask for it. If the **restarts** counter on the web page goes up, the supply is still too weak (see [Troubleshooting](#11-troubleshooting)).
+- WiFi draws current in bursts, up to about 300 mA. The sketch keeps this down with a soft motor start and by sending no video unless you ask for it. If the **restarts** counter on the web page goes up, the supply is still too weak (see [Troubleshooting](#11-troubleshooting)).
 
 ---
 
@@ -269,7 +269,7 @@ The laptop gets an address like `192.168.4.2`. The network has **no internet**. 
 
 **Photo mode (default)** sends nothing over WiFi except tiny drive commands. When you press 📷 the robot takes one fresh picture (about 4 KB at 320×240) and sends it. This keeps commands fast and saves power.
 
-**Video mode** sends pictures continuously. The robot captures the next frame only after the previous one has been handed to the network, so video can never build up a backlog in front of the drive commands. The CPU runs at 240 MHz while streaming and drops back to 80 MHz when you switch back to photo mode.
+**Video mode** sends pictures continuously. The robot captures the next frame only after the previous one has been handed to the network, so video can never build up a backlog in front of the drive commands. It uses much more WiFi and power than photo mode.
 
 ### Keyboard
 
@@ -289,7 +289,7 @@ The laptop gets an address like `192.168.4.2`. The network has **no internet**. 
 
 ### Safety stop
 
-The robot only moves while it keeps receiving commands. While a key is held, the browser resends the command every 200 ms; while stopped it checks in every 2 s. If the robot hears nothing for **500 ms**, it stops the motors. It also stops the moment the connection closes. So if you close the tab, switch windows, walk out of WiFi range or the laptop disconnects, the robot stops instead of driving away.
+The robot only moves while it keeps receiving commands. While a key is held, the browser resends the command every 200 ms; while stopped it checks in every second. If the robot hears nothing for **500 ms**, it stops the motors. It also stops the moment the connection closes. So if you close the tab, switch windows, walk out of WiFi range or the laptop disconnects, the robot stops instead of driving away.
 
 ---
 
@@ -307,12 +307,13 @@ One open connection avoids the cost of a new HTTP request per command. Earlier v
 ### Startup (`setup()`)
 
 1. **Brown-out detector off.** When WiFi starts, the current spike can make battery voltage dip, and the ESP32's brown-out detector would reset the board. It's turned off so the robot keeps running on AA cells.
-2. **CPU at 80 MHz**, the lowest speed WiFi works at. It saves 20–30 mA and is plenty for driving. Video mode raises it to 240 MHz while streaming.
-3. **Restart counter.** The reason for the last restart and a counter kept in RTC memory are printed and shown on the page, which makes brown-outs easy to spot.
-4. **Camera init.** The sensor is power-cycled with its PWDN pin first, because it keeps power across an ESP32 reset and can be left in a state where it won't answer. The driver starts at 640×480 so its JPEG buffer is big enough for any picture size, then switches to 320×240. It uses `CAMERA_GRAB_WHEN_EMPTY` with one buffer, so nothing is captured until a frame is taken.
-5. **Motor PWM.** Each of the 4 motor pins gets its own PWM channel (1 kHz, 8-bit, so 0–255). Channels **2–5** are used on purpose, because the camera needs channel 0 and timer 0 for its clock (XCLK). Sharing them would break the camera.
-6. **WiFi access point.** The board scans first and starts `Robo-CAM` on the least crowded of channels 1, 6 and 11, with WiFi sleep off and transmit power reduced to 8.5 dBm (smaller current bursts, still ample range in a room).
-7. **One web server on port 80**, with a connection budget (see below), and the picture task.
+2. **Restart counter.** The reason for the last restart and a counter kept in RTC memory are printed and shown on the page, which makes brown-outs easy to spot.
+3. **Camera init.** The sensor is power-cycled with its PWDN pin first, because it keeps power across an ESP32 reset and can be left in a state where it won't answer. The driver starts at 640×480 so its JPEG buffer is big enough for any picture size, then switches to 320×240. It uses `CAMERA_GRAB_WHEN_EMPTY` with one buffer, so nothing is captured until a frame is taken.
+4. **Motor PWM.** Each of the 4 motor pins gets its own PWM channel (1 kHz, 8-bit, so 0–255). Channels **2–5** are used on purpose, because the camera needs channel 0 and timer 0 for its 20 MHz clock (XCLK). Sharing them would break the camera.
+5. **WiFi access point.** The board scans first and starts `Robo-CAM` on the least crowded of channels 1, 6 and 11, with WiFi sleep off and transmit power at the maximum.
+6. **One web server on port 80**, with a connection budget (see below), and the picture task.
+
+> **Tried and reverted:** an 80 MHz CPU (raised to 240 MHz only while streaming) and reduced transmit power, to save current on batteries. The link became slow and the board hung and reset. A dependable link matters more than battery life here, so the CPU stays at full speed and the radio at full power; give the ESP32 a supply that can feed it (4×AA or a power bank) instead of starving the radio. Changing the CPU clock while WiFi is running is best avoided.
 
 ### Main loop (`loop()`)
 
@@ -397,8 +398,7 @@ Everything is at the top of `robo_wifi/robo_wifi.ino`:
 |---|---|---|
 | `AP_SSID` | `Robo-CAM` | WiFi network name |
 | `AP_PASS` | `robo12345` | WiFi password, at least 8 characters |
-| `WIFI_TX_POWER` | `WIFI_POWER_8_5dBm` | WiFi transmit power. Raise to `WIFI_POWER_13dBm` for more range, at the cost of bigger current spikes. |
-| `CPU_MHZ` | 80 | CPU speed outside video mode |
+| `WIFI_TX_POWER` | `WIFI_POWER_19_5dBm` | WiFi transmit power, at the maximum. Lower values shrink current spikes but weaken the link. |
 | `LEFT_IN1` … `RIGHT_IN2` | 14, 15, 13, 12 | Motor pins |
 | `CMD_TIMEOUT_MS` | 500 | Safety stop delay |
 | `RAMP_STEP` | 20 | Soft start rate (PWM steps per 5 ms) |
@@ -425,7 +425,7 @@ s->set_hmirror(s, 1);
 | Can't see `Robo-CAM` in the WiFi list | The board isn't running or keeps rebooting. Check the 5V power; try USB power. Watch the serial monitor: it should print `WiFi AP "Robo-CAM" ... -> http://192.168.4.1`. |
 | Laptop keeps leaving `Robo-CAM` | Your computer prefers a network with internet and switches back automatically. Turn off **Auto-Join** for your other WiFi networks while driving. |
 | `192.168.4.1` shows a different website or asks for https | You're not actually on `Robo-CAM`. Some other networks use the same address. Check that your laptop's IP starts with `192.168.4.` |
-| Page shows "Reconnecting…" often | The link is dropping. Check the health line: if **restarts** goes up, the ESP32's battery is too weak (see [Power](#2-power)). Otherwise move closer, or raise `WIFI_TX_POWER`. On a Mac, AirDrop briefly moves the WiFi radio to other channels; `sudo ifconfig awdl0 down` turns that off until you restart. |
+| Page shows "Reconnecting…" often | The link is dropping. Check the health line: if **restarts** goes up, the ESP32's battery is too weak (see [Power](#2-power)). Otherwise move closer, or raise `WIFI_TX_POWER` to `WIFI_POWER_19_5dBm`. On a Mac, AirDrop briefly moves the WiFi radio to other channels; `sudo ifconfig awdl0 down` turns that off until you restart. |
 | Restart count goes up | Brown-out: the ESP32 isn't getting enough power. Use 4×AA or a USB power bank for it, and add a 470–1000 µF capacitor across its 5V and GND. |
 | No picture, or "camera not found" | Reseat the camera ribbon cable. Over USB, send `p` in the serial monitor: it prints what the camera does. A full power cycle (not just reset) clears a sensor stuck in a bad state. |
 | Commands feel slow | Switch **View** to photo mode, which leaves the WiFi almost free. The status line shows the delay in ms: under about 50 ms is good. |

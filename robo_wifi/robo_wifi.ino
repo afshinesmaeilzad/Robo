@@ -22,11 +22,10 @@
 const char *AP_SSID = "Robo-CAM";
 const char *AP_PASS = "robo12345";
 
-// Low power: lower transmit power = smaller current spikes (fewer brown-outs on
-// AA cells), still plenty of range for driving in a room. Max is WIFI_POWER_19_5dBm.
-const wifi_power_t WIFI_TX_POWER = WIFI_POWER_8_5dBm;
-// 80 MHz is the lowest CPU clock WiFi works with; plenty for this sketch
-const int CPU_MHZ = 80;
+// Full transmit power: a solid link matters more than battery life. Lower
+// values (8.5 and 13 dBm) were tried to save current and made the link slow
+// and unreliable. Feed the ESP32 from 4xAA or a power bank instead.
+const wifi_power_t WIFI_TX_POWER = WIFI_POWER_19_5dBm;
 
 // L293D inputs (same wiring as motor_test)
 const int LEFT_IN1  = 14;
@@ -81,6 +80,7 @@ SemaphoreHandle_t camLock;                     // one capture at a time
 TaskHandle_t picTask = NULL;
 volatile bool sendBusy = false;                // a picture is queued / being sent
 volatile bool streaming = false;               // video mode: keep sending frames
+volatile int streamFps = 5;                    // video frame-rate cap (1-25)
 volatile framesize_t wantSize = FRAMESIZE_QVGA;
 volatile uint32_t picSent = 0, picFailed = 0, lastPicBytes = 0, lastPicMs = 0;
 
@@ -162,6 +162,9 @@ select,button.b{background:#333;color:#eee;border:0;border-radius:6px;padding:6p
   <label>View <select id="mode">
     <option value="photo" selected>Photo (on request)</option><option value="video">Video (uses more power)</option>
   </select></label>
+  <label id="fpslabel" style="display:none">FPS <select id="fps">
+    <option value="1">1</option><option value="2">2</option><option value="5" selected>5</option><option value="10">10</option><option value="15">15</option><option value="25">max</option>
+  </select></label>
   <button class="b" id="snap">📷 Take picture</button>
   <label>Size <select id="res">
     <option value="qqvga">160x120</option><option value="qvga" selected>320x240</option><option value="vga">640x480</option>
@@ -233,6 +236,7 @@ const mode = document.getElementById('mode');
 mode.onchange = () => {
   video = mode.value === 'video';
   snap.style.display = video ? 'none' : '';
+  document.getElementById('fpslabel').style.display = video ? '' : 'none';
   snap.disabled = false;
   askedAt = performance.now();
   send(video ? 'v1' : 'v0');
@@ -240,12 +244,12 @@ mode.onchange = () => {
 };
 connect();
 // Keep-alive: every 200 ms while moving (robot stops after 500 ms of silence),
-// every 2 s while stopped (just to detect a dead link).
+// every second while stopped, so a dead link is noticed quickly.
 setInterval(() => {
   if (!ws || ws.readyState !== 1) return;
   const now = performance.now();
-  if (now - lastEcho > 6000) { ws.close(); return; }
-  if (lastDir !== 's' || now - lastSend >= 2000) send(lastDir);
+  if (now - lastEcho > 3000) { ws.close(); return; }
+  if (lastDir !== 's' || now - lastSend >= 1000) send(lastDir);
 }, 200);
 setInterval(() => { if (ws && ws.readyState === 1) showStatus(); }, 1000);
 
@@ -294,6 +298,7 @@ setInterval(health, 10000);
 
 document.getElementById('spd').onchange = e => fetch('/set?speed=' + e.target.value);
 document.getElementById('res').onchange = e => fetch('/set?size=' + e.target.value);
+document.getElementById('fps').onchange = e => fetch('/set?fps=' + e.target.value);
 let led = 0;
 document.getElementById('led').onclick = () => { led ^= 1; fetch('/set?led=' + led); };
 </script></body></html>)HTML";
@@ -343,7 +348,7 @@ bool initCamera() {
   c.pin_vsync = VSYNC_GPIO_NUM; c.pin_href = HREF_GPIO_NUM;
   c.pin_sccb_sda = SIOD_GPIO_NUM; c.pin_sccb_scl = SIOC_GPIO_NUM;
   c.pin_pwdn = PWDN_GPIO_NUM; c.pin_reset = RESET_GPIO_NUM;
-  c.xclk_freq_hz = 10000000;  // slower sensor clock = less power; pictures still ~0.2 s
+  c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
   // The driver sizes its JPEG buffer from the init frame size, so init at the
   // largest size the page offers; frames that don't fit are dropped (FB-OVF).
@@ -376,36 +381,38 @@ bool initCamera() {
 
 // ---------- sending pictures ----------
 
-struct PicJob {
-  int fd;
-  size_t len;
-  uint8_t data[];
-};
+// One reusable buffer: only one picture is ever in flight (sendBusy), and
+// allocating per frame in video mode fragments the heap and can crash the board.
+static uint8_t *picBuf = NULL;
+static size_t picBufCap = 0;
+static int picFd = -1;
+static size_t picLen = 0;
 
 // Runs inside the HTTP server task, so it never collides with command replies
 static void sendPicWork(void *arg) {
-  PicJob *job = (PicJob *)arg;
-  if (httpd_ws_get_fd_info(server, job->fd) == HTTPD_WS_CLIENT_WEBSOCKET) {
+  if (httpd_ws_get_fd_info(server, picFd) == HTTPD_WS_CLIENT_WEBSOCKET) {
     httpd_ws_frame_t f = {};
     f.type = HTTPD_WS_TYPE_BINARY;
-    f.payload = job->data;
-    f.len = job->len;
-    httpd_ws_send_frame_async(server, job->fd, &f);
+    f.payload = picBuf;
+    f.len = picLen;
+    httpd_ws_send_frame_async(server, picFd, &f);
   }
-  free(job);
   sendBusy = false;
 }
 
 static bool queuePicture(camera_fb_t *fb, int fd) {
-  PicJob *job = (PicJob *)heap_caps_malloc(sizeof(PicJob) + fb->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!job) job = (PicJob *)malloc(sizeof(PicJob) + fb->len);
-  if (!job) return false;
-  job->fd = fd;
-  job->len = fb->len;
-  memcpy(job->data, fb->buf, fb->len);
+  if (fb->len > picBufCap) {
+    uint8_t *grown = (uint8_t *)heap_caps_realloc(picBuf, fb->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!grown) grown = (uint8_t *)realloc(picBuf, fb->len);
+    if (!grown) return false;
+    picBuf = grown;
+    picBufCap = fb->len;
+  }
+  memcpy(picBuf, fb->buf, fb->len);
+  picFd = fd;
+  picLen = fb->len;
   sendBusy = true;
-  if (httpd_queue_work(server, sendPicWork, job) != ESP_OK) {
-    free(job);
+  if (httpd_queue_work(server, sendPicWork, NULL) != ESP_OK) {
     sendBusy = false;
     return false;
   }
@@ -432,6 +439,7 @@ static void sendOnePicture(int fd, int warmup) {
 void setStreaming(bool on);
 
 static void pictureTask(void *) {
+  uint32_t lastFrameMs = 0;
   for (;;) {
     if (!streaming) {
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // sleeps until a picture is asked for
@@ -441,7 +449,11 @@ static void pictureTask(void *) {
     }
     int fd = wsFd;
     if (fd < 0) { setStreaming(false); continue; }
-    if (sendBusy) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }  // wait for the last frame to go out
+    vTaskDelay(pdMS_TO_TICKS(5));  // always yield: a tight loop trips the watchdog
+    if (sendBusy) continue;        // wait for the last frame to go out
+    uint32_t frameMs = 1000 / constrain(streamFps, 1, 25);
+    if (millis() - lastFrameMs < frameMs) continue;
+    lastFrameMs = millis();
     sendOnePicture(fd, 0);  // frames are already flowing: no warm-up needed
   }
 }
@@ -450,11 +462,10 @@ static void requestPicture() {
   if (picTask) xTaskNotifyGive(picTask);
 }
 
-// Video needs the full CPU; photo mode runs slow and cool
+// Changing the CPU clock at runtime hung the board, so it stays at full speed
 void setStreaming(bool on) {
   if (streaming == on) return;
   streaming = on;
-  setCpuFrequencyMhz(on ? 240 : CPU_MHZ);
   Serial.printf("[%lu ms] video %s\n", millis(), on ? "on" : "off");
   if (on) requestPicture();
 }
@@ -528,6 +539,7 @@ static esp_err_t setHandler(httpd_req_t *req) {
   char v[12];
   if (queryParam(req, "speed", v, sizeof(v))) speed = constrain(atoi(v), 0, 255);
   if (queryParam(req, "led", v, sizeof(v)))   digitalWrite(FLASH_LED, atoi(v) ? HIGH : LOW);
+  if (queryParam(req, "fps", v, sizeof(v)))   streamFps = constrain(atoi(v), 1, 25);
   if (queryParam(req, "size", v, sizeof(v))) {
     // Applied at the next picture, while the camera is awake
     if (!strcmp(v, "qqvga")) wantSize = FRAMESIZE_QQVGA;
@@ -559,10 +571,10 @@ static esp_err_t infoHandler(httpd_req_t *req) {
   char out[256];
   snprintf(out, sizeof(out),
            "{\"up\":%lu,\"boots\":%lu,\"reset\":\"%s\",\"ch\":%d,\"rssi\":%d,\"clients\":%d,\"heap\":%lu,"
-           "\"cam\":%d,\"video\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,\"picms\":%lu}",
+           "\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,\"picms\":%lu}",
            (unsigned long)(millis() / 1000), (unsigned long)bootCount, resetReason(), apChannel,
            rssi, WiFi.softAPgetStationNum(), (unsigned long)ESP.getMinFreeHeap(),
-           camReady ? 1 : 0, streaming ? 1 : 0, (unsigned long)picSent, (unsigned long)picFailed,
+           camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
            (unsigned long)lastPicBytes, (unsigned long)lastPicMs);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -650,7 +662,6 @@ int pickChannel() {
 
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // battery dips when WiFi starts
-  setCpuFrequencyMhz(CPU_MHZ);
   Serial.begin(115200);
   if (bootMagic != 0x520B0 || esp_reset_reason() == ESP_RST_POWERON) { bootMagic = 0x520B0; bootCount = 0; }
   else bootCount++;
