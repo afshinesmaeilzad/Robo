@@ -104,13 +104,10 @@ async def main() -> int:
                    str(mission.finished_summary)))
     checks.append(("no error", mission.error is None, str(mission.error)))
     checks.append(("two pictures taken", mission.pictures == 2, str(mission.pictures)))
-    # The fake robot returns the same picture every time, so the second view is
-    # recognised locally and never sent to the model
-    checks.append(("only the first image sent", mission.images_sent == 1, str(mission.images_sent)))
-    checks.append(("second view skipped", mission.images_skipped == 1, str(mission.images_skipped)))
+    checks.append(("moving robot is not 'stuck'", mission.stuck_events == 0,
+                   str(mission.stuck_events)))
+    checks.append(("both changed views sent", mission.images_sent == 2, str(mission.images_sent)))
     checks.append(("index holds both views", len(index.shots) == 2, str(len(index.shots))))
-    checks.append(("skip was logged", any(k == "same" for k, t in events),
-                   str([k for k, _ in events])))
 
     # 1000 ms forward at 20 cm/s then a 500 ms spin at 180 deg/s
     checks.append(("moved forward ~20cm", 19 < robot.pose.x < 21, f"x={robot.pose.x:.1f}"))
@@ -134,7 +131,7 @@ async def main() -> int:
     dropped = [m for m in last if isinstance(m.get("content"), str)
                and "picture dropped" in m["content"]]
     checks.append(("one image kept in context", len(images) == 1, str(len(images))))
-    checks.append(("no image was pruned (only one was ever sent)", len(dropped) == 0, str(len(dropped))))
+    checks.append(("older image pruned", len(dropped) == 1, str(len(dropped))))
 
     # Fingerprints: same picture matches itself, a different one does not
     same = robot_jpeg = await robot.picture()
@@ -146,6 +143,63 @@ async def main() -> int:
                    f"{similarity(fa, ha, fb, hb):.3f}"))
     checks.append(("different pictures score low", similarity(fa, ha, fc, hc) < 0.9,
                    f"{similarity(fa, ha, fc, hc):.3f}"))
+
+    # --- an unchanged view (robot did not move between two looks) is not sent twice ---
+    events.clear()
+    tmp_same = Path(tempfile.mkdtemp())
+    robot_same = FakeRobot(Calibration(), frozen=True)
+    agent_same = Agent(robot_same, Memory(tmp_same),
+                       StubModel([("Look.", [tool_call("1", "look", reason="a")]),
+                                  ("Again.", [tool_call("2", "look", reason="b")]),
+                                  ("Done.", [tool_call("3", "finish", summary="x")])]),
+                       "stub", lambda k, t: events.append((k, t)), index=VisionIndex(tmp_same))
+    m_same = await agent_same.run("same view", max_steps=5)
+    checks.append(("unchanged view sent once", m_same.images_sent == 1, str(m_same.images_sent)))
+    checks.append(("unchanged view skipped once", m_same.images_skipped == 1,
+                   str(m_same.images_skipped)))
+    checks.append(("skip was logged", any(k == "same" for k, t in events),
+                   str([k for k, _ in events])))
+
+    # --- stuck detection: a frozen view after a real move must trigger the escape ---
+    events.clear()
+    stuck_script = [
+        ("Look.", [tool_call("1", "look", reason="start")]),
+        ("Drive.", [tool_call("2", "move", direction="f", ms=1000)]),
+        ("Give up.", [tool_call("3", "finish", summary="blocked")]),
+    ]
+    robot2 = FakeRobot(Calibration(cm_per_sec=20, deg_per_sec=180, speed=255), frozen=True)
+    tmp2 = Path(tempfile.mkdtemp())
+    agent2 = Agent(robot2, Memory(tmp2), StubModel(stuck_script), "stub",
+                   lambda k, t: events.append((k, t)), index=VisionIndex(tmp2))
+    m2 = await agent2.run("stuck test", max_steps=5)
+
+    checks.append(("stuck was detected", m2.stuck_events == 1, str(m2.stuck_events)))
+    checks.append(("stuck was logged", any(k == "stuck" for k, t in events),
+                   str([k for k, _ in events])))
+    # escape = back 600 ms + turn 500 ms, on top of the 1000 ms forward move
+    escape = [mv for mv in robot2.moves if mv.direction in ("b", "l", "r")]
+    checks.append(("backed out", any(mv.direction == "b" and mv.ms == 600 for mv in escape),
+                   str([(mv.direction, mv.ms) for mv in escape])))
+    checks.append(("turned away", any(mv.direction in ("l", "r") and mv.ms == 500 for mv in escape),
+                   str([(mv.direction, mv.ms) for mv in escape])))
+    told = any("stuck" in msg.get("content", "")
+               for msgs in agent2.messages and [agent2.messages] for msg in msgs
+               if msg.get("role") == "tool" and isinstance(msg.get("content"), str))
+    checks.append(("model was told", told, "no 'stuck' in any tool reply"))
+
+    # a short nudge must NOT count as stuck
+    events.clear()
+    nudge_script = [
+        ("Look.", [tool_call("1", "look", reason="start")]),
+        ("Nudge.", [tool_call("2", "move", direction="f", ms=150)]),
+        ("Stop.", [tool_call("3", "finish", summary="done")]),
+    ]
+    tmp3 = Path(tempfile.mkdtemp())
+    robot3 = FakeRobot(Calibration(cm_per_sec=20, deg_per_sec=180, speed=255), frozen=True)
+    agent3 = Agent(robot3, Memory(tmp3), StubModel(nudge_script), "stub",
+                   lambda k, t: events.append((k, t)), index=VisionIndex(tmp3))
+    m3 = await agent3.run("nudge test", max_steps=5)
+    checks.append(("short nudge is not 'stuck'", m3.stuck_events == 0, str(m3.stuck_events)))
 
     failed = 0
     for name, ok, detail in checks:

@@ -22,6 +22,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from agent import Agent
+from discover import find_robot
 from memory import Memory
 from robot import Calibration, FakeRobot, Robot, RobotError
 from vision_index import VisionIndex
@@ -116,6 +117,7 @@ async def state():
             "pictures": m.pictures,
             "images_sent": m.images_sent,
             "images_skipped": m.images_skipped,
+            "stuck_events": m.stuck_events,
             "summary": m.finished_summary,
             "error": m.error,
         },
@@ -139,6 +141,38 @@ async def picture(fresh: bool = False):
 @app.get("/api/robot")
 async def robot_info():
     return JSONResponse(await robot.info())
+
+
+@app.post("/api/find")
+async def find():
+    """Look for the robot on the local network and use what is found."""
+    global ROBOT_HOST
+    if isinstance(robot, FakeRobot):
+        return {"found": "fake"}
+    host = await find_robot(None if ROBOT_HOST in ("auto", "") else ROBOT_HOST)
+    if not host:
+        raise HTTPException(
+            404,
+            "No robot found. Is it powered on and on this network? "
+            "Check the serial monitor for the address it printed.",
+        )
+    ROBOT_HOST = robot.host = host
+    return {"found": host}
+
+
+@app.on_event("startup")
+async def startup():
+    """With ROBOT_HOST=auto, go looking for the robot before the first mission."""
+    global ROBOT_HOST
+    if ROBOT_HOST != "auto":
+        return
+    events.append({"t": time.time(), "kind": "find", "text": "looking for the robot..."})
+    host = await find_robot()
+    ROBOT_HOST = robot.host = host or "192.168.4.1"
+    events.append(
+        {"t": time.time(), "kind": "find",
+         "text": f"robot at {host}" if host else "no robot found; set ROBOT_HOST in .env"}
+    )
 
 
 @app.on_event("shutdown")
@@ -177,6 +211,7 @@ button{cursor:pointer}button.go{background:#2a7}button.stop{background:#a33}
     <button onclick="drive('b')">▼ back</button>
     <button onclick="drive('r')">spin ▶</button>
     <button onclick="refresh(true)">📷 picture</button>
+    <button onclick="post('/api/find')">🔎 find robot</button>
   </div>
   <canvas id="map" height="320"></canvas>
 </div>
@@ -224,9 +259,10 @@ async function tick(){
       (s.key_loaded ? '' : ' · NO API KEY') +
       ` · index ${s.index_size} views` +
       (m ? ` · ${m.running ? 'running' : 'idle'} step ${m.steps}/${m.max_steps}` +
-           ` · ${m.pictures} pictures, ${m.images_sent} sent, ${m.images_skipped} skipped` : '');
+           ` · ${m.pictures} pictures, ${m.images_sent} sent, ${m.images_skipped} skipped` +
+           (m.stuck_events ? ` · stuck ${m.stuck_events}x` : '') : '');
     $('log').innerHTML = s.events.map(e =>
-      `<span class="${e.kind === 'error' ? 'err' : e.kind === 'memory' ? 'note' : 'k'}">` +
+      `<span class="${['error','stuck'].includes(e.kind) ? 'err' : e.kind === 'memory' ? 'note' : 'k'}">` +
       `[${e.kind}]</span> ${e.text.replace(/</g, '&lt;')}`).join('\\n');
     if (s.events.length && s.events[s.events.length-1].t !== lastEvent){
       lastEvent = s.events[s.events.length-1].t;

@@ -34,6 +34,7 @@ HASH_SIZE = 8          # dHash grid: 8x8 comparisons = 64 bits
 HIST_BINS = 8          # per channel
 SAME_VIEW = 0.97       # at or above this, the view counts as unchanged
 FAMILIAR = 0.80        # at or above this, the place looks familiar
+STUCK_VIEW = 0.985     # at or above this after a real move, the robot did not move
 
 
 @dataclass

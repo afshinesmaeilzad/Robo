@@ -23,7 +23,8 @@ from openai import AsyncOpenAI
 
 from memory import Memory, Note
 from robot import Robot, RobotError
-from vision_index import FAMILIAR, SAME_VIEW, Shot, VisionIndex
+from vision_index import (FAMILIAR, SAME_VIEW, STUCK_VIEW, Shot, VisionIndex,
+                          fingerprint, similarity)
 
 SYSTEM_PROMPT = """You are driving a small two-wheel robot with a camera, exploring an indoor room.
 
@@ -54,6 +55,9 @@ Working method:
   machine. If a view has not changed it tells you so instead of sending the
   picture again, and if a view looks like somewhere you have been it shows you
   the notes made there. Trust those hints: they mean you are going in circles.
+- If the robot is blocked, the server notices (the view does not change after a
+  move), backs it out and turns it. You are told when that happens: pick a
+  different direction, do not push the same way again.
 - Call finish() when the goal is met or you cannot safely continue.
 
 Be brief in your reasoning. Prefer acting to explaining."""
@@ -176,6 +180,7 @@ class Mission:
     pictures: int = 0      # taken by the camera
     images_sent: int = 0   # actually sent to the model
     images_skipped: int = 0  # unchanged views, sent as text instead
+    stuck_events: int = 0    # moves that changed nothing, so an escape was driven
     started: float = field(default_factory=time.time)
     finished_summary: str | None = None
     error: str | None = None
@@ -204,6 +209,8 @@ class Agent:
         self.mission: Mission | None = None
         self.last_jpeg: bytes | None = None
         self.last_shot: Shot | None = None
+        self.last_change: float = 0.0   # how alike the last two pictures were
+        self.escape_turn = "r"          # alternates, so escapes don't repeat
         self.messages: list[dict[str, Any]] = []
 
     # ---------- helpers ----------
@@ -232,6 +239,13 @@ class Agent:
         # The new picture is not in the index yet, so nothing needs excluding
         matches = self.index.matches(jpeg)
         best = matches[0] if matches else None
+        # How much did the view change since the previous picture? That is what
+        # tells a blocked robot from a moving one.
+        if self.last_shot is not None:
+            phash, hist = fingerprint(jpeg)
+            self.last_change = similarity(phash, hist, self.last_shot.phash, self.last_shot.hist)
+        else:
+            self.last_change = 0.0
         unchanged = (
             best is not None
             and best[0] >= SAME_VIEW
@@ -276,6 +290,34 @@ class Agent:
                 text = next((p["text"] for p in msg["content"] if p.get("type") == "text"), "")
                 msg["content"] = f"{text} (picture dropped to save tokens)"
 
+    async def _escape(self) -> str:
+        """Back out of whatever the robot is caught on and turn away from it."""
+        self.escape_turn = "l" if self.escape_turn == "r" else "r"
+        if self.mission:
+            self.mission.stuck_events += 1
+        self.log("stuck", f"view unchanged after moving; backing up and turning {self.escape_turn}")
+        try:
+            await self.robot.move("b", 600)
+            await self.robot.move(self.escape_turn, 500)
+        except RobotError as exc:
+            return f"Tried to back out but the robot did not answer: {exc}"
+        return (
+            "The view did not change after that move, so the robot is stuck: the wheels are "
+            "blocked, or it is pressed against something the camera cannot see well. "
+            f"I have backed it up and turned it {'left' if self.escape_turn == 'l' else 'right'}. "
+            "Do not push the same way again: pick another direction."
+        )
+
+    async def _look_after_move(self, moved_ms: int) -> tuple[str, str | None]:
+        """Picture after a move, with a stuck check when the move was long enough."""
+        text, b64 = await self._take_picture()
+        real_move = moved_ms >= 300  # shorter nudges may genuinely change nothing
+        if real_move and self.last_change >= STUCK_VIEW:
+            escape = await self._escape()
+            text2, b64_2 = await self._take_picture()
+            return f"{escape}\n{text2}", b64_2 or b64
+        return text, b64
+
     # ---------- tools ----------
 
     async def _run_tool(self, name: str, args: dict) -> tuple[str, str | None]:
@@ -287,7 +329,10 @@ class Agent:
         if name == "move":
             await self.robot.move(args["direction"], args["ms"])
             self.log("move", f"{args['direction']} {args['ms']}ms -> {pose.as_text()}")
-            return f"Moved. Estimated position: {pose.as_text()}", None
+            if self.last_jpeg is None:  # nothing to compare with yet
+                return f"Moved. Estimated position: {pose.as_text()}", None
+            text, b64 = await self._look_after_move(args["ms"])
+            return f"Moved. Estimated position: {pose.as_text()}. {text}", b64
 
         if name == "follow_path":
             steps = args.get("steps", [])
@@ -298,7 +343,7 @@ class Agent:
                 await self.robot.move(step["direction"], step["ms"])
                 done.append(f"{step['direction']} {step['ms']}ms")
             self.log("path", f"{' + '.join(done) or 'nothing'} -> {pose.as_text()}")
-            text, b64 = await self._take_picture()
+            text, b64 = await self._look_after_move(sum(s["ms"] for s in steps[: len(done)]))
             return (
                 f"Path done ({len(done)} of {len(steps)} steps: {', '.join(done)}). "
                 f"Estimated position: {pose.as_text()}. {text}"

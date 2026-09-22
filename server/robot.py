@@ -167,10 +167,15 @@ class Robot:
 
 
 class FakeRobot(Robot):
-    """Offline stand-in, so the server can run without hardware (ROBOT_HOST=fake)."""
+    """Offline stand-in, so the server can run without hardware (ROBOT_HOST=fake).
 
-    def __init__(self, cal: Calibration):
+    Its "camera" draws a view that depends on where the robot is, so moving
+    really does change the picture, as on the real thing.
+    """
+
+    def __init__(self, cal: Calibration, frozen: bool = False):
         super().__init__("fake", cal)
+        self.frozen = frozen  # frozen=True: the view never changes (a stuck robot)
 
     async def connect(self) -> None:
         return
@@ -182,17 +187,23 @@ class FakeRobot(Robot):
         return
 
     async def picture(self, size: str | None = None) -> bytes:
-        import base64
+        import io
 
-        # A tiny grey JPEG, enough to exercise the whole pipeline
-        return base64.b64decode(
-            "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
-            "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAAIAAgBAREA/8QAHwAAAQUBAQEB"
-            "AQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1Fh"
-            "ByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZ"
-            "WmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG"
-            "x8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/APn+v//Z"
-        )
+        from PIL import Image, ImageDraw
+
+        p = Pose() if self.frozen else self.pose
+        img = Image.new("RGB", (160, 120), (40, 40, 48))
+        d = ImageDraw.Draw(img)
+        # A "floor" whose horizon moves with the heading, and a marker that
+        # slides past as the robot drives: enough for the picture to change.
+        horizon = 60 + int(p.heading) % 40
+        d.rectangle([0, horizon, 160, 120], fill=(90, 80, 70))
+        spot = int(p.x * 2) % 160
+        d.ellipse([spot - 12, horizon - 24, spot + 12, horizon], fill=(200, 180, 60))
+        d.text((4, 4), f"{p.x:.0f},{p.y:.0f} {p.heading:.0f}deg", fill=(230, 230, 230))
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=70)
+        return buf.getvalue()
 
     async def info(self) -> dict:
         return {"up": 0, "boots": 0, "reset": "fake", "rssi": -30, "cam": 1}

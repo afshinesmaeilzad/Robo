@@ -14,6 +14,27 @@ limits that stop it driving into things.
                                     http://localhost:8000 (watch, start, stop)
 ```
 
+## Where each setting goes
+
+| What | Where | Example |
+|---|---|---|
+| OpenAI key | `server/.env` | `OPENAI_API_KEY=sk-...` |
+| WiFi name and password | top of `robo_wifi/robo_wifi.ino` | `#define HOME_SSID "my-wifi"` |
+| Robot's address | `server/.env` | `ROBOT_HOST=auto` |
+
+**The robot does not need this machine's address.** The server is the client: it
+opens the connection to the robot, sends the commands and asks for the pictures.
+So your laptop's IP can change, and nothing on the robot has to be updated.
+
+**Finding the robot** works three ways, set by `ROBOT_HOST`:
+
+- `auto` — at startup the server asks every address on the local network whether
+  it answers `/info` like a Robo. Takes a second or two, and works inside Docker.
+  The **🔎 find robot** button on the dashboard does the same at any time.
+- `robo.local` — the name the robot advertises. Works on the host, but usually
+  not inside a container.
+- `192.168.1.42` — the address the robot prints on the serial monitor at boot.
+
 ## Setup
 
 1. **Key.** Copy the example and paste your key. `.env` is git-ignored, so the
@@ -80,6 +101,23 @@ It is kept in `data/vision_index.json` and loaded at startup.
 
 The dashboard shows the count: **pictures taken, sent, skipped**.
 
+## When the robot cannot move
+
+A wheel catches on a rug, the robot noses into a chair leg, the battery sags
+under load: the command is sent, the position estimate moves, and the robot
+stays exactly where it was.
+
+The server catches this with the same fingerprints: after a move of 300 ms or
+more, if the new picture is **98.5% or more** the same as the one before it, the
+robot did not actually move. The server then drives an escape by itself —
+**back 600 ms, then turn 500 ms**, turning the other way each time so it doesn't
+repeat the same escape — takes a fresh picture, and tells the model what
+happened, so it picks a different direction instead of pushing the same way.
+
+Short nudges under 300 ms are exempt: they may genuinely change nothing.
+
+The dashboard counts these as **stuck Nx**.
+
 ## How the agent works
 
 The model is given these tools:
@@ -132,6 +170,7 @@ than an image.
 python test_agent.py
 ```
 
-Runs a scripted mission with a stub model and a fake robot: no key, no hardware.
-It checks the tool handling, the image pruning, the dead reckoning and the
-memory file.
+Runs three scripted missions against a stub model and a fake robot whose view
+changes as it drives: no key, no hardware. It checks the tool handling, the
+image pruning, the dead reckoning, the memory file, the "same view" skip and the
+stuck escape (28 checks).
