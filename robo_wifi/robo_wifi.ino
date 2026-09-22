@@ -60,6 +60,14 @@ const int RAMP_STEP = 20;
 // Frames thrown away before a picture (the buffered one is stale)
 const int CAM_WARMUP_FRAMES = 2;
 
+// Flash: in the dark the camera sees nothing useful, so the LED is switched on
+// for the picture and off again. Brightness is 0-255, measured from the picture
+// the robot just took; below DARK_BELOW the flash is used.
+// 0 = auto (dark pictures only), 1 = always, 2 = never.
+volatile int flashMode = 0;
+const int DARK_BELOW = 55;
+const int FLASH_SETTLE_FRAMES = 3;  // frames to let exposure adjust to the light
+
 // AI-Thinker ESP32-CAM camera pins
 #define PWDN_GPIO_NUM  32
 #define RESET_GPIO_NUM -1
@@ -99,6 +107,8 @@ RTC_NOINIT_ATTR uint32_t bootMagic;
 RTC_NOINIT_ATTR uint32_t bootCount;
 int apChannel = 1;
 bool joinedHome = false;
+volatile bool lastUsedFlash = false;
+volatile int lastBrightness = -1;
 const char *MDNS_NAME = "robo";  // http://robo.local
 
 httpd_handle_t server = NULL;
@@ -178,6 +188,9 @@ select,button.b{background:#333;color:#eee;border:0;border-radius:6px;padding:6p
     <option value="1">1</option><option value="2">2</option><option value="5" selected>5</option><option value="10">10</option><option value="15">15</option><option value="25">max</option>
   </select></label>
   <button class="b" id="snap">📷 Take picture</button>
+  <label>Flash <select id="flash">
+    <option value="auto" selected>auto (dark only)</option><option value="on">always</option><option value="off">never</option>
+  </select></label>
   <label>Size <select id="res">
     <option value="qqvga">160x120</option><option value="qvga" selected>320x240</option><option value="vga">640x480</option>
   </select></label>
@@ -310,6 +323,7 @@ setInterval(health, 10000);
 
 document.getElementById('spd').onchange = e => fetch('/set?speed=' + e.target.value);
 document.getElementById('res').onchange = e => fetch('/set?size=' + e.target.value);
+document.getElementById('flash').onchange = e => fetch('/set?flash=' + e.target.value);
 document.getElementById('fps').onchange = e => fetch('/set?fps=' + e.target.value);
 let led = 0;
 document.getElementById('led').onclick = () => { led ^= 1; fetch('/set?led=' + led); };
@@ -343,7 +357,25 @@ static camera_fb_t *camCapture(int warmup) {
       esp_camera_fb_return(fb);
     }
   }
-  return esp_camera_fb_get();
+  camera_fb_t *fb = esp_camera_fb_get();
+  lastUsedFlash = false;
+  if (!fb || flashMode == 2) return fb;  // no picture, or flash switched off
+
+  lastBrightness = jpegBrightness(fb);
+  if (flashMode == 1 || (flashMode == 0 && lastBrightness >= 0 && lastBrightness < DARK_BELOW)) {
+    esp_camera_fb_return(fb);
+    digitalWrite(FLASH_LED, HIGH);
+    // The first frames are still exposed for the dark: let the camera catch up
+    for (int i = 0; i < FLASH_SETTLE_FRAMES; i++) {
+      camera_fb_t *warm = esp_camera_fb_get();
+      if (warm) esp_camera_fb_return(warm);
+    }
+    fb = esp_camera_fb_get();
+    digitalWrite(FLASH_LED, LOW);
+    lastUsedFlash = true;
+    if (fb) lastBrightness = jpegBrightness(fb);
+  }
+  return fb;
 }
 
 static void camRelease() {
@@ -551,6 +583,11 @@ static esp_err_t setHandler(httpd_req_t *req) {
   char v[12];
   if (queryParam(req, "speed", v, sizeof(v))) speed = constrain(atoi(v), 0, 255);
   if (queryParam(req, "led", v, sizeof(v)))   digitalWrite(FLASH_LED, atoi(v) ? HIGH : LOW);
+  if (queryParam(req, "flash", v, sizeof(v))) {
+    if (!strcmp(v, "auto")) flashMode = 0;
+    else if (!strcmp(v, "on")) flashMode = 1;
+    else if (!strcmp(v, "off")) flashMode = 2;
+  }
   if (queryParam(req, "fps", v, sizeof(v)))   streamFps = constrain(atoi(v), 1, 25);
   if (queryParam(req, "size", v, sizeof(v))) {
     // Applied at the next picture, while the camera is awake
@@ -587,11 +624,13 @@ static esp_err_t infoHandler(httpd_req_t *req) {
   char out[256];
   snprintf(out, sizeof(out),
            "{\"up\":%lu,\"boots\":%lu,\"reset\":\"%s\",\"ch\":%d,\"rssi\":%d,\"clients\":%d,\"heap\":%lu,"
-           "\"home\":%d,\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,\"picms\":%lu}",
+           "\"home\":%d,\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,"
+           "\"picms\":%lu,\"flash\":%d,\"usedflash\":%d,\"bright\":%d}",
            (unsigned long)(millis() / 1000), (unsigned long)bootCount, resetReason(), apChannel,
            rssi, WiFi.softAPgetStationNum(), (unsigned long)ESP.getMinFreeHeap(),
            joinedHome ? 1 : 0, camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
-           (unsigned long)lastPicBytes, (unsigned long)lastPicMs);
+           (unsigned long)lastPicBytes, (unsigned long)lastPicMs,
+           flashMode, lastUsedFlash ? 1 : 0, lastBrightness);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_sendstr(req, out);

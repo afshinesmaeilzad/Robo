@@ -181,6 +181,8 @@ class Mission:
     images_sent: int = 0   # actually sent to the model
     images_skipped: int = 0  # unchanged views, sent as text instead
     stuck_events: int = 0    # moves that changed nothing, so an escape was driven
+    tokens_in: int = 0
+    tokens_out: int = 0
     started: float = field(default_factory=time.time)
     finished_summary: str | None = None
     error: str | None = None
@@ -419,6 +421,10 @@ class Agent:
                     tools=TOOLS,
                     parallel_tool_calls=False,
                 )
+                usage = getattr(response, "usage", None)
+                if usage:
+                    mission.tokens_in += usage.prompt_tokens or 0
+                    mission.tokens_out += usage.completion_tokens or 0
                 choice = response.choices[0].message
                 self.messages.append(choice.model_dump(exclude_none=True))
                 if choice.content:

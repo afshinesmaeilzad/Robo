@@ -149,16 +149,26 @@ class Robot:
     # ---------- camera ----------
 
     async def picture(self, size: str | None = None) -> bytes:
-        """One JPEG. `size` is qqvga, qvga or vga."""
+        """One JPEG. `size` is qqvga, qvga or vga.
+
+        A picture can take a moment (warm-up frames, and the flash settling in
+        the dark), and WiFi drops the odd packet, so one retry is worth it.
+        """
         async with self._lock:
             if size:
                 await self._http.get(f"http://{self.host}/set", params={"size": size})
-            try:
-                r = await self._http.get(f"http://{self.host}/jpg")
-                r.raise_for_status()
-            except Exception as exc:  # noqa: BLE001
-                raise RobotError(f"no picture from the robot: {exc}") from exc
-            return r.content
+            last = "unknown"
+            for attempt in range(2):
+                try:
+                    r = await self._http.get(f"http://{self.host}/jpg", timeout=10.0)
+                    r.raise_for_status()
+                    return r.content
+                except Exception as exc:  # noqa: BLE001
+                    # Timeouts stringify to "", which says nothing in a log
+                    last = str(exc) or type(exc).__name__
+                    if attempt == 0:
+                        await asyncio.sleep(0.3)
+            raise RobotError(f"no picture from the robot ({last})")
 
     async def set_speed(self, speed: int) -> None:
         self.cal.speed = max(80, min(int(speed), 255))
