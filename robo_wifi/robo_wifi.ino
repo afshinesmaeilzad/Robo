@@ -28,8 +28,8 @@ const char *AP_PASS = "robo12345";
 // server/). Leave HOME_SSID empty to keep the robot's own "Robo-CAM" network.
 // If it cannot join within JOIN_TIMEOUT_MS it makes its own network anyway, so
 // a wrong password or a router that is off never locks you out.
-#define HOME_SSID ""
-#define HOME_PASS ""
+#define HOME_SSID "iPhone"
+#define HOME_PASS "afshines1371"
 const uint32_t JOIN_TIMEOUT_MS = 15000;
 
 // Full transmit power: a solid link matters more than battery life. Lower
@@ -681,6 +681,21 @@ void startWiFi() {
   if (strlen(HOME_SSID) > 0) {
     Serial.printf("Joining WiFi \"%s\" ...\n", HOME_SSID);
     WiFi.mode(WIFI_STA);
+    // Look for it first: the ESP32 is 2.4 GHz only, so a 5 GHz-only network
+    // (an iPhone hotspot without "Maximize Compatibility") is simply invisible.
+    int found = WiFi.scanNetworks();
+    bool visible = false;
+    for (int i = 0; i < found; i++)
+      if (WiFi.SSID(i) == HOME_SSID) {
+        visible = true;
+        Serial.printf("  found \"%s\": channel %d, signal %d dBm, %s\n", HOME_SSID,
+                      WiFi.channel(i), WiFi.RSSI(i),
+                      WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "password");
+      }
+    if (!visible)
+      Serial.printf("  \"%s\" is not in range on 2.4 GHz (%d networks seen). An iPhone "
+                    "hotspot needs \"Maximize Compatibility\" switched on.\n", HOME_SSID, found);
+    WiFi.scanDelete();
     WiFi.begin(HOME_SSID, HOME_PASS);
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < JOIN_TIMEOUT_MS) delay(200);
@@ -693,7 +708,16 @@ void startWiFi() {
       if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
       return;
     }
+    switch (WiFi.status()) {
+      case WL_NO_SSID_AVAIL:
+        Serial.println("  network not found (wrong name, out of range, or 5 GHz only)"); break;
+      case WL_CONNECT_FAILED:
+        Serial.println("  refused: check the password"); break;
+      default:
+        Serial.printf("  gave up waiting (status %d)\n", WiFi.status());
+    }
     Serial.println("Could not join; making our own network instead.");
+    WiFi.disconnect(true);
   }
   apChannel = pickChannel();
   WiFi.mode(WIFI_AP);
