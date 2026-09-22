@@ -183,6 +183,7 @@ class Mission:
     stuck_events: int = 0    # moves that changed nothing, so an escape was driven
     tokens_in: int = 0
     tokens_out: int = 0
+    tokens_cached: int = 0  # part of tokens_in that was served from cache
     started: float = field(default_factory=time.time)
     finished_summary: str | None = None
     error: str | None = None
@@ -425,6 +426,8 @@ class Agent:
                 if usage:
                     mission.tokens_in += usage.prompt_tokens or 0
                     mission.tokens_out += usage.completion_tokens or 0
+                    details = getattr(usage, "prompt_tokens_details", None)
+                    mission.tokens_cached += getattr(details, "cached_tokens", 0) or 0
                 choice = response.choices[0].message
                 self.messages.append(choice.model_dump(exclude_none=True))
                 if choice.content:

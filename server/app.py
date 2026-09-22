@@ -35,8 +35,9 @@ PICTURE_SIZE = os.getenv("PICTURE_SIZE", "qvga")
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data"))
 # Rough prices per million tokens, for the estimate on the dashboard only.
 # Check what your account is actually charged; set these in .env.
-PRICE_IN = float(os.getenv("PRICE_IN_PER_M", "2.0"))
-PRICE_OUT = float(os.getenv("PRICE_OUT_PER_M", "8.0"))
+PRICE_IN = float(os.getenv("PRICE_IN_PER_M", "0.40"))
+PRICE_CACHED = float(os.getenv("PRICE_CACHED_PER_M", "0.10"))
+PRICE_OUT = float(os.getenv("PRICE_OUT_PER_M", "1.60"))
 CAL = Calibration(
     cm_per_sec=float(os.getenv("CM_PER_SEC", "20")),
     deg_per_sec=float(os.getenv("DEG_PER_SEC", "180")),
@@ -124,7 +125,13 @@ async def state():
             "stuck_events": m.stuck_events,
             "tokens_in": m.tokens_in,
             "tokens_out": m.tokens_out,
-            "cost": round(m.tokens_in / 1e6 * PRICE_IN + m.tokens_out / 1e6 * PRICE_OUT, 3),
+            "tokens_cached": m.tokens_cached,
+            "cost": round(
+                (m.tokens_in - m.tokens_cached) / 1e6 * PRICE_IN
+                + m.tokens_cached / 1e6 * PRICE_CACHED
+                + m.tokens_out / 1e6 * PRICE_OUT,
+                4,
+            ),
             "seconds": round(time.time() - m.started),
             "summary": m.finished_summary,
             "error": m.error,
@@ -269,8 +276,9 @@ async function tick(){
       (m ? ` · ${m.running ? 'running' : 'idle'} step ${m.steps}/${m.max_steps}` +
            ` · ${m.pictures} pictures, ${m.images_sent} sent, ${m.images_skipped} skipped` +
            (m.stuck_events ? ` · stuck ${m.stuck_events}x` : '') +
-           ` · ${(m.tokens_in/1000).toFixed(0)}k in / ${(m.tokens_out/1000).toFixed(1)}k out` +
-           ` ≈ $${m.cost.toFixed(2)}` +
+           ` · ${(m.tokens_in/1000).toFixed(0)}k in (${(m.tokens_cached/1000).toFixed(0)}k cached)` +
+           ` / ${(m.tokens_out/1000).toFixed(1)}k out` +
+           ` ≈ $${m.cost.toFixed(3)}` +
            (m.steps ? ` · ${(m.seconds/m.steps).toFixed(1)}s per step` : '') : '');
     $('log').innerHTML = s.events.map(e =>
       `<span class="${['error','stuck'].includes(e.kind) ? 'err' : e.kind === 'memory' ? 'note' : 'k'}">` +

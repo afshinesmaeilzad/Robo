@@ -164,6 +164,14 @@ picture is a few hundred tokens. `PICTURE_SIZE=qqvga` and a smaller `max_steps`
 keep a mission cheap while you experiment, and unchanged views cost text rather
 than an image.
 
+The dashboard shows tokens in (and how many of those were cached), tokens out,
+seconds per step and an estimated price. The prices come from `.env` and default
+to `gpt-4.1-mini`'s — $0.40 per million in, $0.10 cached, $1.60 out. It is an
+estimate for comparing missions, not your bill.
+
+Measured on real missions with `gpt-4.1-mini` at 320×240: about 8 seconds per
+step, nearly all of it model latency rather than the robot.
+
 ## Testing
 
 ```bash
