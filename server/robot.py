@@ -56,7 +56,7 @@ class RobotError(RuntimeError):
 class Robot:
     """One robot, one WebSocket. Commands are serialised: one move at a time."""
 
-    def __init__(self, host: str, cal: Calibration, timeout: float = 5.0):
+    def __init__(self, host: str, cal: Calibration, timeout: float = 12.0):
         self.host = host
         self.cal = cal
         self.timeout = timeout
@@ -73,15 +73,28 @@ class Robot:
         return self._ws is not None and self._ws.state is State.OPEN
 
     async def connect(self) -> None:
+        """Open the drive link, retrying once.
+
+        A phone hotspot lets clients doze between packets, so a single attempt
+        can time out on a link that is otherwise working.
+        """
         if self.connected():
             return
         if self._ws is not None:  # a dead link: drop it and make a new one
             self._ws = None
         url = f"ws://{self.host}/ws"
-        try:
-            self._ws = await asyncio.wait_for(websockets.connect(url, max_size=None), self.timeout)
-        except Exception as exc:  # noqa: BLE001 - surfaced to the caller as one error
-            raise RobotError(f"cannot reach the robot at {url}: {exc}") from exc
+        last = "unknown"
+        for attempt in range(2):
+            try:
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(url, max_size=None), self.timeout
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - one error for the caller
+                last = str(exc) or type(exc).__name__  # timeouts stringify to ""
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+        raise RobotError(f"cannot reach the robot at {url} ({last})")
 
     async def close(self) -> None:
         if self._ws is not None:
@@ -99,7 +112,7 @@ class Robot:
             await self._ws.send(text)
         except Exception as exc:  # noqa: BLE001
             self._ws = None
-            raise RobotError(f"lost the drive link: {exc}") from exc
+            raise RobotError(f"lost the drive link ({str(exc) or type(exc).__name__})") from exc
 
     # ---------- driving ----------
 

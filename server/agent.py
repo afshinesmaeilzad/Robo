@@ -58,6 +58,9 @@ Working method:
 - If the robot is blocked, the server notices (the view does not change after a
   move), backs it out and turns it. You are told when that happens: pick a
   different direction, do not push the same way again.
+- "Robot problem" messages are usually a brief WiFi hiccup, not a broken robot.
+  Try the same thing again, or take a picture; only give up if several attempts
+  in a row fail.
 - Call finish() when the goal is met or you cannot safely continue.
 
 Be brief in your reasoning. Prefer acting to explaining."""
