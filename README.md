@@ -36,7 +36,8 @@ Commands come first: they travel over one always-open WebSocket as tiny messages
 9. [API](#9-api)
 10. [Customizing](#10-customizing)
 11. [Troubleshooting](#11-troubleshooting)
-12. [Project structure](#12-project-structure)
+12. [AI explorer](#12-ai-explorer-server)
+13. [Project structure](#13-project-structure)
 
 ---
 
@@ -438,7 +439,29 @@ s->set_hmirror(s, 1);
 
 ---
 
-## 12. Project structure
+## 12. AI explorer (`server/`)
+
+An optional server that lets an OpenAI vision model drive the robot: it looks
+through the camera, explores the room, avoids obstacles and remembers what it
+finds. The server keeps the robot's estimated position (dead reckoning from the
+commands it sent) and its memory of earlier runs, so the model can plan several
+moves from one picture instead of looking after every step.
+
+Your API key lives in `server/.env`, which git ignores, and is passed to the
+container at run time — it is never committed or baked into the image.
+
+```bash
+cp server/.env.example server/.env   # paste your key
+cd server && docker compose up --build
+```
+
+Then open http://localhost:8000. Set `ROBOT_HOST=fake` to try it with no
+hardware. Full details, including calibration and cost, are in
+[server/README.md](server/README.md).
+
+---
+
+## 13. Project structure
 
 ```
 Robo/
@@ -447,6 +470,13 @@ Robo/
 │   └── motor_test.ino      step 1: wiring and motor test (serial control)
 ├── robo_wifi/
 │   └── robo_wifi.ino       step 2: WiFi access point + control + pictures
-└── tools/
-    └── robo_test.js        link test: command delay, drops, picture delivery
+├── tools/
+│   └── robo_test.js        link test: command delay, drops, picture delivery
+└── server/                 optional: GPT-4.1 explores the room
+    ├── app.py              FastAPI server and dashboard
+    ├── agent.py            the model's tools and the mission loop
+    ├── robot.py            drive commands (ws) and pictures (/jpg), dead reckoning
+    ├── memory.py           notes and snapshots that survive between runs
+    ├── test_agent.py       offline check: stub model, fake robot
+    └── docker-compose.yml  runs it, reading the key from .env
 ```
