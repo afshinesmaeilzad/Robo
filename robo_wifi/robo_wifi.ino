@@ -14,6 +14,7 @@
 #include "img_converters.h"
 #include "esp_http_server.h"
 #include "esp_wifi.h"
+#include <ESPmDNS.h>
 #include "esp_attr.h"
 #include "lwip/sockets.h"
 #include "soc/soc.h"
@@ -21,6 +22,15 @@
 
 const char *AP_SSID = "Robo-CAM";
 const char *AP_PASS = "robo12345";
+
+// Optional: put your home network here and the robot joins it instead of making
+// its own, so one computer can reach both the robot and the internet (see
+// server/). Leave HOME_SSID empty to keep the robot's own "Robo-CAM" network.
+// If it cannot join within JOIN_TIMEOUT_MS it makes its own network anyway, so
+// a wrong password or a router that is off never locks you out.
+#define HOME_SSID ""
+#define HOME_PASS ""
+const uint32_t JOIN_TIMEOUT_MS = 15000;
 
 // Full transmit power: a solid link matters more than battery life. Lower
 // values (8.5 and 13 dBm) were tried to save current and made the link slow
@@ -88,6 +98,8 @@ volatile uint32_t picSent = 0, picFailed = 0, lastPicBytes = 0, lastPicMs = 0;
 RTC_NOINIT_ATTR uint32_t bootMagic;
 RTC_NOINIT_ATTR uint32_t bootCount;
 int apChannel = 1;
+bool joinedHome = false;
+const char *MDNS_NAME = "robo";  // http://robo.local
 
 httpd_handle_t server = NULL;
 
@@ -566,15 +578,19 @@ static const char *resetReason() {
 // Robot health for the page: uptime, restarts, signal strength, picture stats
 static esp_err_t infoHandler(httpd_req_t *req) {
   int rssi = 0;
-  wifi_sta_list_t sta;
-  if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) rssi = sta.sta[0].rssi;
+  if (joinedHome) {
+    rssi = WiFi.RSSI();  // our signal from the router
+  } else {
+    wifi_sta_list_t sta;
+    if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) rssi = sta.sta[0].rssi;
+  }
   char out[256];
   snprintf(out, sizeof(out),
            "{\"up\":%lu,\"boots\":%lu,\"reset\":\"%s\",\"ch\":%d,\"rssi\":%d,\"clients\":%d,\"heap\":%lu,"
-           "\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,\"picms\":%lu}",
+           "\"home\":%d,\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,\"picms\":%lu}",
            (unsigned long)(millis() / 1000), (unsigned long)bootCount, resetReason(), apChannel,
            rssi, WiFi.softAPgetStationNum(), (unsigned long)ESP.getMinFreeHeap(),
-           camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
+           joinedHome ? 1 : 0, camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
            (unsigned long)lastPicBytes, (unsigned long)lastPicMs);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -658,6 +674,37 @@ int pickChannel() {
   return cand[best];
 }
 
+// Join the home network if one is configured, otherwise (or on failure) make
+// our own. mDNS gives the robot a name, so its address doesn't have to be hunted.
+void startWiFi() {
+  WiFi.setSleep(false);
+  if (strlen(HOME_SSID) > 0) {
+    Serial.printf("Joining WiFi \"%s\" ...\n", HOME_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(HOME_SSID, HOME_PASS);
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < JOIN_TIMEOUT_MS) delay(200);
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.setTxPower(WIFI_TX_POWER);
+      apChannel = WiFi.channel();
+      joinedHome = true;
+      Serial.printf("Joined \"%s\" on channel %d  ->  http://%s  (or http://%s.local)\n",
+                    HOME_SSID, apChannel, WiFi.localIP().toString().c_str(), MDNS_NAME);
+      if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+      return;
+    }
+    Serial.println("Could not join; making our own network instead.");
+  }
+  apChannel = pickChannel();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS, apChannel);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_TX_POWER);
+  Serial.printf("WiFi AP \"%s\" / \"%s\" on channel %d  ->  http://%s\n", AP_SSID, AP_PASS, apChannel,
+                WiFi.softAPIP().toString().c_str());
+  if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+}
+
 // ---------- main ----------
 
 void setup() {
@@ -679,13 +726,7 @@ void setup() {
   setMotor(LEFT_IN1, LEFT_IN2, 0);
   setMotor(RIGHT_IN1, RIGHT_IN2, 0);
 
-  apChannel = pickChannel();
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS, apChannel);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_TX_POWER);
-  Serial.printf("WiFi AP \"%s\" / \"%s\" on channel %d  ->  http://%s\n", AP_SSID, AP_PASS, apChannel,
-                WiFi.softAPIP().toString().c_str());
+  startWiFi();
 
   startServer();
   if (camReady)

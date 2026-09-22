@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from agent import Agent
 from memory import Memory
 from robot import Calibration, FakeRobot
+from vision_index import VisionIndex, similarity, fingerprint
 
 
 def tool_call(id_: str, name: str, **args):
@@ -58,6 +59,20 @@ class StubModel:
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
+def Image_bytes() -> bytes:
+    """A picture that looks nothing like the fake robot's grey frame."""
+    import io
+
+    from PIL import Image
+
+    img = Image.new("RGB", (64, 64))
+    img.putdata([((x * 4) % 256, 255 - (y * 4) % 256, (x + y) % 256)
+                 for y in range(64) for x in range(64)])
+    buf = io.BytesIO()
+    img.save(buf, "JPEG")
+    return buf.getvalue()
+
+
 async def main() -> int:
     tmp = Path(tempfile.mkdtemp())
     robot = FakeRobot(Calibration(cm_per_sec=20, deg_per_sec=180, speed=255))
@@ -77,7 +92,9 @@ async def main() -> int:
         ("Done.", [tool_call("5", "finish", summary="explored a bit")]),
     ]
     model = StubModel(script)
-    agent = Agent(robot, memory, model, "stub", lambda k, t: events.append((k, t)), keep_images=1)
+    index = VisionIndex(tmp)
+    agent = Agent(robot, memory, model, "stub", lambda k, t: events.append((k, t)),
+                  keep_images=1, index=index)
 
     mission = await agent.run("test mission", max_steps=10)
 
@@ -87,6 +104,13 @@ async def main() -> int:
                    str(mission.finished_summary)))
     checks.append(("no error", mission.error is None, str(mission.error)))
     checks.append(("two pictures taken", mission.pictures == 2, str(mission.pictures)))
+    # The fake robot returns the same picture every time, so the second view is
+    # recognised locally and never sent to the model
+    checks.append(("only the first image sent", mission.images_sent == 1, str(mission.images_sent)))
+    checks.append(("second view skipped", mission.images_skipped == 1, str(mission.images_skipped)))
+    checks.append(("index holds both views", len(index.shots) == 2, str(len(index.shots))))
+    checks.append(("skip was logged", any(k == "same" for k, t in events),
+                   str([k for k, _ in events])))
 
     # 1000 ms forward at 20 cm/s then a 500 ms spin at 180 deg/s
     checks.append(("moved forward ~20cm", 19 < robot.pose.x < 21, f"x={robot.pose.x:.1f}"))
@@ -110,7 +134,18 @@ async def main() -> int:
     dropped = [m for m in last if isinstance(m.get("content"), str)
                and "picture dropped" in m["content"]]
     checks.append(("one image kept in context", len(images) == 1, str(len(images))))
-    checks.append(("older image pruned", len(dropped) == 1, str(len(dropped))))
+    checks.append(("no image was pruned (only one was ever sent)", len(dropped) == 0, str(len(dropped))))
+
+    # Fingerprints: same picture matches itself, a different one does not
+    same = robot_jpeg = await robot.picture()
+    other = bytes(Image_bytes())
+    fa, ha = fingerprint(robot_jpeg)
+    fb, hb = fingerprint(same)
+    fc, hc = fingerprint(other)
+    checks.append(("identical pictures score ~1", similarity(fa, ha, fb, hb) > 0.99,
+                   f"{similarity(fa, ha, fb, hb):.3f}"))
+    checks.append(("different pictures score low", similarity(fa, ha, fc, hc) < 0.9,
+                   f"{similarity(fa, ha, fc, hc):.3f}"))
 
     failed = 0
     for name, ok, detail in checks:

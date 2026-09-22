@@ -23,14 +23,22 @@ limits that stop it driving into things.
    cp server/.env.example server/.env
    ```
 
-2. **Flash the robot** with `robo_wifi` (or `robo_lite`) and power it up.
+2. **Put the robot on your home WiFi.** In `robo_wifi/robo_wifi.ino`, fill in
 
-3. **Join the robot's WiFi** (`Robo-CAM`). The server has to be on the same
-   network as the robot. Your computer then has no internet over WiFi, so the
-   OpenAI calls need another route: an ethernet adapter, a phone over USB, or a
-   second WiFi adapter. Without one, run with `ROBOT_HOST=fake` to try the
-   server, or put the robot on your home WiFi instead (see "Robot on your own
-   WiFi" below).
+   ```cpp
+   #define HOME_SSID "your-network"
+   #define HOME_PASS "your-password"
+   ```
+
+   then flash it. The robot joins that network and prints its address; it also
+   answers to `robo.local`. If it cannot join in 15 s it falls back to making
+   its own `Robo-CAM` network, so a typo never locks you out.
+
+   This matters because the server needs the robot **and** the internet at the
+   same time. On the robot's own network your computer has no internet.
+
+3. **Set `ROBOT_HOST`** in `.env` to the address the robot printed (or
+   `robo.local`). Use `fake` to try the server with no hardware at all.
 
 ## Run
 
@@ -50,6 +58,27 @@ Then open **http://localhost:8000**: the camera view, the estimated path, the
 live log and the memory, with Start and Stop buttons.
 
 To try the whole thing without hardware, set `ROBOT_HOST=fake` in `.env`.
+
+## Not sending the same picture twice
+
+Every snapshot is fingerprinted **locally** (`vision_index.py`): a 64-bit
+difference hash of its structure, plus a colour histogram. Comparing those takes
+microseconds and needs no model, so before anything goes to OpenAI the server
+can answer two questions:
+
+- **"Is this the same view I already sent?"** At 97% similar or above, the
+  picture is *not* sent again. The model gets a line of text instead: the view
+  has not changed, and the note made there. A robot that is stuck against a
+  chair therefore costs a few tokens per step instead of a picture per step.
+- **"Have I been here before?"** At 80% or above, the notes made at those
+  earlier views are added as text, so the model is told it is going in circles
+  and can use what it learned last time.
+
+`remember()` ties the note to the picture it was made from, so the index grows
+into a small searchable memory of places: fingerprint, position and description.
+It is kept in `data/vision_index.json` and loaded at startup.
+
+The dashboard shows the count: **pictures taken, sent, skipped**.
 
 ## How the agent works
 
@@ -90,18 +119,12 @@ Dead reckoning is only as good as two numbers in `.env`. Measure them once:
 
 The estimate drifts, especially on carpet. It is a hint for the model, not a map.
 
-## Robot on your own WiFi
-
-Simplest if you only have one WiFi adapter: change the sketch from access-point
-mode to joining your home network (`WiFi.mode(WIFI_STA)` and `WiFi.begin(ssid,
-pass)`), then set `ROBOT_HOST` to the address it gets. Your computer keeps its
-internet, and the server reaches both the robot and OpenAI.
-
 ## Cost
 
 Each step is one model call with at most a few small pictures. At 320×240 a
 picture is a few hundred tokens. `PICTURE_SIZE=qqvga` and a smaller `max_steps`
-keep a mission cheap while you experiment.
+keep a mission cheap while you experiment, and unchanged views cost text rather
+than an image.
 
 ## Testing
 

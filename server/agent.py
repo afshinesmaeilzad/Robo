@@ -23,6 +23,7 @@ from openai import AsyncOpenAI
 
 from memory import Memory, Note
 from robot import Robot, RobotError
+from vision_index import FAMILIAR, SAME_VIEW, Shot, VisionIndex
 
 SYSTEM_PROMPT = """You are driving a small two-wheel robot with a camera, exploring an indoor room.
 
@@ -49,6 +50,10 @@ Working method:
 - Call remember() whenever you see something worth keeping: a room, a doorway, a
   large object, a blocked path. Use recall() before exploring somewhere you may
   have been before.
+- The server compares every new picture with the ones it already has, on this
+  machine. If a view has not changed it tells you so instead of sending the
+  picture again, and if a view looks like somewhere you have been it shows you
+  the notes made there. Trust those hints: they mean you are going in circles.
 - Call finish() when the goal is met or you cannot safely continue.
 
 Be brief in your reasoning. Prefer acting to explaining."""
@@ -168,7 +173,9 @@ class Mission:
     running: bool = False
     stop_requested: bool = False
     steps: int = 0
-    pictures: int = 0
+    pictures: int = 0      # taken by the camera
+    images_sent: int = 0   # actually sent to the model
+    images_skipped: int = 0  # unchanged views, sent as text instead
     started: float = field(default_factory=time.time)
     finished_summary: str | None = None
     error: str | None = None
@@ -184,6 +191,7 @@ class Agent:
         on_event: Callable[[str, str], None],
         picture_size: str = "qvga",
         keep_images: int = 3,
+        index: VisionIndex | None = None,
     ):
         self.robot = robot
         self.memory = memory
@@ -192,8 +200,10 @@ class Agent:
         self.on_event = on_event
         self.picture_size = picture_size
         self.keep_images = keep_images
+        self.index = index
         self.mission: Mission | None = None
         self.last_jpeg: bytes | None = None
+        self.last_shot: Shot | None = None
         self.messages: list[dict[str, Any]] = []
 
     # ---------- helpers ----------
@@ -201,14 +211,57 @@ class Agent:
     def log(self, kind: str, text: str) -> None:
         self.on_event(kind, text)
 
-    async def _take_picture(self) -> str:
+    async def _take_picture(self) -> tuple[str, str | None]:
+        """Take a picture. Returns (what to tell the model, image or None).
+
+        The image is only sent when the view has actually changed: comparing it
+        with what the model has already seen is local work, sending it again is
+        not. Familiar places come with the notes made there.
+        """
         jpeg = await self.robot.picture(self.picture_size)
         self.last_jpeg = jpeg
-        name = self.memory.save_snapshot(jpeg, f"{self.robot.pose.x:.0f}_{self.robot.pose.y:.0f}")
+        pose = self.robot.pose
+        name = self.memory.save_snapshot(jpeg, f"{pose.x:.0f}_{pose.y:.0f}")
         if self.mission:
             self.mission.pictures += 1
-        self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {self.robot.pose.as_text()}")
-        return base64.b64encode(jpeg).decode()
+
+        if self.index is None:
+            self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {pose.as_text()}")
+            return "Picture taken, see the next message.", base64.b64encode(jpeg).decode()
+
+        # The new picture is not in the index yet, so nothing needs excluding
+        matches = self.index.matches(jpeg)
+        best = matches[0] if matches else None
+        unchanged = (
+            best is not None
+            and best[0] >= SAME_VIEW
+            and best[1].sent
+        )
+        shot = self.index.add(jpeg, name, pose.x, pose.y, pose.heading, sent=not unchanged)
+        self.last_shot = shot
+
+        if unchanged:
+            score, old = best
+            if self.mission:
+                self.mission.images_skipped += 1
+            self.log("same", f"{name} is {score * 100:.0f}% the view from {old.where()}: not sent")
+            note = f" Note made there: {old.label}: {old.description}." if old.label else ""
+            return (
+                f"The view has not changed ({score * 100:.0f}% the same as the picture from "
+                f"{old.where()}), so it is not sent again.{note} "
+                "If you expected it to change, the robot may not have moved: try a longer "
+                "move, or turn."
+            ), None
+
+        if self.mission:
+            self.mission.images_sent += 1
+        self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {pose.as_text()}")
+        text = "Picture taken, see the next message."
+        familiar = [m for m in matches if m[0] >= FAMILIAR]
+        if familiar:
+            self.log("familiar", f"{len(familiar)} similar view(s) seen before")
+            text += "\nThis place looks familiar:\n" + self.index.context(familiar)
+        return text, base64.b64encode(jpeg).decode()
 
     def _prune_images(self) -> None:
         """Keep only the newest images; older ones become a line of text."""
@@ -229,8 +282,7 @@ class Agent:
         """Returns (text for the model, base64 picture or None)."""
         pose = self.robot.pose
         if name == "look":
-            b64 = await self._take_picture()
-            return "Picture taken, see the next message.", b64
+            return await self._take_picture()
 
         if name == "move":
             await self.robot.move(args["direction"], args["ms"])
@@ -246,10 +298,10 @@ class Agent:
                 await self.robot.move(step["direction"], step["ms"])
                 done.append(f"{step['direction']} {step['ms']}ms")
             self.log("path", f"{' + '.join(done) or 'nothing'} -> {pose.as_text()}")
-            b64 = await self._take_picture()
+            text, b64 = await self._take_picture()
             return (
                 f"Path done ({len(done)} of {len(steps)} steps: {', '.join(done)}). "
-                f"Estimated position: {pose.as_text()}. Picture in the next message."
+                f"Estimated position: {pose.as_text()}. {text}"
             ), b64
 
         if name == "remember":
@@ -264,6 +316,8 @@ class Agent:
                     image=self.memory.save_snapshot(self.last_jpeg) if self.last_jpeg else None,
                 )
             )
+            if self.index is not None:
+                self.index.describe(args["label"], args["description"], self.last_shot)
             self.log("memory", note.as_text())
             return f"Remembered: {note.as_text()}", None
 

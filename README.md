@@ -447,6 +447,17 @@ finds. The server keeps the robot's estimated position (dead reckoning from the
 commands it sent) and its memory of earlier runs, so the model can plan several
 moves from one picture instead of looking after every step.
 
+Before a picture is sent to OpenAI the server fingerprints it locally (a
+difference hash plus a colour histogram) and compares it with everything seen
+before. An unchanged view is never sent twice — the model is told in one line of
+text — and a familiar place arrives with the notes made there. That keeps both
+the token bill and the WiFi traffic down.
+
+To put the robot on your home network instead of it making its own, fill in
+`HOME_SSID` and `HOME_PASS` at the top of `robo_wifi/robo_wifi.ino`. The server
+then reaches the robot and the internet at once. If the robot cannot join, it
+falls back to its own `Robo-CAM` network.
+
 Your API key lives in `server/.env`, which git ignores, and is passed to the
 container at run time — it is never committed or baked into the image.
 
@@ -477,6 +488,7 @@ Robo/
     ├── agent.py            the model's tools and the mission loop
     ├── robot.py            drive commands (ws) and pictures (/jpg), dead reckoning
     ├── memory.py           notes and snapshots that survive between runs
+    ├── vision_index.py     local picture fingerprints: is this view new?
     ├── test_agent.py       offline check: stub model, fake robot
     └── docker-compose.yml  runs it, reading the key from .env
 ```

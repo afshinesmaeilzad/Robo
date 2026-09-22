@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from agent import Agent
 from memory import Memory
 from robot import Calibration, FakeRobot, Robot, RobotError
+from vision_index import VisionIndex
 
 load_dotenv()
 
@@ -40,6 +41,7 @@ CAL = Calibration(
 app = FastAPI(title="Robo brain")
 events: deque[dict] = deque(maxlen=400)
 memory = Memory(DATA_DIR)
+index = VisionIndex(DATA_DIR)
 robot: Robot = FakeRobot(CAL) if ROBOT_HOST == "fake" else Robot(ROBOT_HOST, CAL)
 client = AsyncOpenAI() if os.getenv("OPENAI_API_KEY") else None
 agent = Agent(
@@ -49,6 +51,7 @@ agent = Agent(
     model=MODEL,
     on_event=lambda kind, text: events.append({"t": time.time(), "kind": kind, "text": text}),
     picture_size=PICTURE_SIZE,
+    index=index,
 )
 task: asyncio.Task | None = None
 
@@ -102,6 +105,7 @@ async def state():
         "pose": vars(robot.pose),
         "trail": [vars(p) for p in robot.trail[-200:]],
         "notes": [n.as_text() for n in memory.notes[-30:]],
+        "index_size": len(index.shots),
         "mission": None
         if not m
         else {
@@ -110,6 +114,8 @@ async def state():
             "steps": m.steps,
             "max_steps": m.max_steps,
             "pictures": m.pictures,
+            "images_sent": m.images_sent,
+            "images_skipped": m.images_skipped,
             "summary": m.finished_summary,
             "error": m.error,
         },
@@ -216,7 +222,9 @@ async function tick(){
     const m = s.mission;
     $('status').textContent = `· ${s.model} · robot ${s.robot_host}` +
       (s.key_loaded ? '' : ' · NO API KEY') +
-      (m ? ` · ${m.running ? 'running' : 'idle'} step ${m.steps}/${m.max_steps}, ${m.pictures} pictures` : '');
+      ` · index ${s.index_size} views` +
+      (m ? ` · ${m.running ? 'running' : 'idle'} step ${m.steps}/${m.max_steps}` +
+           ` · ${m.pictures} pictures, ${m.images_sent} sent, ${m.images_skipped} skipped` : '');
     $('log').innerHTML = s.events.map(e =>
       `<span class="${e.kind === 'error' ? 'err' : e.kind === 'memory' ? 'note' : 'k'}">` +
       `[${e.kind}]</span> ${e.text.replace(/</g, '&lt;')}`).join('\\n');
