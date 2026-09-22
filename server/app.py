@@ -278,5 +278,5 @@ tick(); setInterval(tick, 1500);
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def dashboard():  # not "index": that name holds the VisionIndex
     return PAGE

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 import httpx
 import websockets
+from websockets.protocol import State
 
 DIRECTIONS = {"f", "b", "l", "r", "fl", "fr", "bl", "br", "s"}
 
@@ -62,15 +63,20 @@ class Robot:
         self.pose = Pose()
         self.trail: list[Pose] = [Pose()]
         self.moves: list[Move] = []
-        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._ws: websockets.ClientConnection | None = None
         self._lock = asyncio.Lock()
         self._http = httpx.AsyncClient(timeout=timeout)
 
     # ---------- connection ----------
 
+    def connected(self) -> bool:
+        return self._ws is not None and self._ws.state is State.OPEN
+
     async def connect(self) -> None:
-        if self._ws and not self._ws.closed:
+        if self.connected():
             return
+        if self._ws is not None:  # a dead link: drop it and make a new one
+            self._ws = None
         url = f"ws://{self.host}/ws"
         try:
             self._ws = await asyncio.wait_for(websockets.connect(url, max_size=None), self.timeout)
@@ -78,8 +84,11 @@ class Robot:
             raise RobotError(f"cannot reach the robot at {url}: {exc}") from exc
 
     async def close(self) -> None:
-        if self._ws:
-            await self._ws.close()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001 - already gone is fine
+                pass
             self._ws = None
         await self._http.aclose()
 

@@ -32,9 +32,13 @@ from PIL import Image
 
 HASH_SIZE = 8          # dHash grid: 8x8 comparisons = 64 bits
 HIST_BINS = 8          # per channel
-SAME_VIEW = 0.97       # at or above this, the view counts as unchanged
+# Thresholds measured on the real camera: with the robot standing completely
+# still, consecutive pictures score 0.959-0.990 (the structure hash wobbles by
+# up to 3 of 64 bits from sensor noise, the histogram barely at all). So
+# "unchanged" has to sit below that noise floor, not at 0.99.
+SAME_VIEW = 0.95       # at or above this, the view counts as unchanged
 FAMILIAR = 0.80        # at or above this, the place looks familiar
-STUCK_VIEW = 0.985     # at or above this after a real move, the robot did not move
+STUCK_VIEW = 0.95      # at or above this after a real move, the robot did not move
 
 
 @dataclass
