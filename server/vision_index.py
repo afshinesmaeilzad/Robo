@@ -37,7 +37,9 @@ HIST_BINS = 8          # per channel
 # up to 3 of 64 bits from sensor noise, the histogram barely at all). So
 # "unchanged" has to sit below that noise floor, not at 0.99.
 SAME_VIEW = 0.95       # at or above this, the view counts as unchanged
-FAMILIAR = 0.80        # at or above this, the place looks familiar
+# 0.80 matched almost everything in one room (same floor, same wall colour) and
+# told the model it was going in circles on nearly every picture.
+FAMILIAR = 0.90        # at or above this, the place looks familiar
 STUCK_VIEW = 0.95      # at or above this after a real move, the robot did not move
 
 

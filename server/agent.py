@@ -26,6 +26,10 @@ from robot import Robot, RobotError
 from vision_index import (FAMILIAR, SAME_VIEW, STUCK_VIEW, Shot, VisionIndex,
                           fingerprint, similarity)
 
+# Below this much travel, an early finish() is questioned once: a model that
+# reads "stop when you get there" literally tends to stop at the first glimpse.
+MIN_TRAVEL_CM = 150
+
 SYSTEM_PROMPT = """You are driving a small two-wheel robot with a camera, exploring an indoor room.
 
 Your goals, in order:
@@ -43,7 +47,13 @@ How the robot moves:
 Working method:
 - Take a picture with look(), then plan SEVERAL moves from it with follow_path().
   Pictures are costly, so do not look after every small move.
-- In a tight spot, move in short steps (300-500 ms) and look more often.
+- COVER GROUND. When the floor ahead is clearly open, send several long steps at
+  once: follow_path with 3-6 steps of 1000-2000 ms. Crossing a room or a corridor
+  takes tens of seconds of driving, not one short nudge. Short 300-500 ms steps
+  are only for tight spots and fine aiming.
+- To go through a doorway or down a corridor: turn to face it, check the picture,
+  then drive through it in one long path rather than stopping every few
+  centimetres.
 - Before driving forward, be sure the floor ahead is clear in the last picture.
   If you are unsure, spin a little and look again instead of driving blind.
 - The server tells you the estimated position after every move. It drifts, so
@@ -61,7 +71,11 @@ Working method:
 - "Robot problem" messages are usually a brief WiFi hiccup, not a broken robot.
   Try the same thing again, or take a picture; only give up if several attempts
   in a row fail.
-- Call finish() when the goal is met or you cannot safely continue.
+- Call finish() only when the goal is really met, or you are truly blocked, or
+  you have run out of steps. Reaching the entrance of somewhere is not the same
+  as having been there: go in, look around and note what is inside first.
+  "Stop for a new mission" means stop when the task is done, not at the first
+  glimpse of the target.
 
 Be brief in your reasoning. Prefer acting to explaining."""
 
@@ -203,6 +217,8 @@ class Agent:
         picture_size: str = "qvga",
         keep_images: int = 3,
         index: VisionIndex | None = None,
+        image_detail: str = "low",
+        reasoning_effort: str | None = None,
     ):
         self.robot = robot
         self.memory = memory
@@ -211,12 +227,17 @@ class Agent:
         self.on_event = on_event
         self.picture_size = picture_size
         self.keep_images = keep_images
+        # "low" sends the picture at a fixed small token cost: enough to see a
+        # floor, a doorway or a chair leg, and far cheaper than "high".
+        self.image_detail = image_detail
+        self.reasoning_effort = reasoning_effort  # e.g. "none" on models that think
         self.index = index
         self.mission: Mission | None = None
         self.last_jpeg: bytes | None = None
         self.last_shot: Shot | None = None
         self.last_change: float = 0.0   # how alike the last two pictures were
         self.escape_turn = "r"          # alternates, so escapes don't repeat
+        self.finish_questioned = False  # an early finish is questioned once
         self.messages: list[dict[str, Any]] = []
 
     # ---------- helpers ----------
@@ -380,18 +401,53 @@ class Agent:
             return "\n".join(n.as_text() for n in hits), None
 
         if name == "finish":
-            if self.mission:
-                self.mission.finished_summary = args["summary"]
+            m = self.mission
+            # Finishing after a few centimetres usually means the goal was read
+            # too literally. Push back once; obey if it insists.
+            if (m and m.steps < m.max_steps // 3 and self.robot.pose.distance < MIN_TRAVEL_CM
+                    and not self.finish_questioned):
+                self.finish_questioned = True
+                self.log("keep-going", f"finish after only {self.robot.pose.distance:.0f}cm")
+                return (
+                    f"You have driven only {self.robot.pose.distance:.0f} cm and used "
+                    f"{m.steps} of {m.max_steps} steps. That is not much of the space yet. "
+                    "Unless you are blocked, keep going: drive further, look around the "
+                    "next corner, and note what you find. Call finish() again if you are "
+                    "certain the goal is met."
+                ), None
+            if m:
+                m.finished_summary = args["summary"]
             self.log("finish", args["summary"])
             return "Mission ended.", None
 
         return f"Unknown tool {name}.", None
+
+    async def _ask(self):
+        """One model call. Drops reasoning_effort if this model does not take it."""
+        kwargs = dict(
+            model=self.model,
+            messages=self.messages,
+            tools=TOOLS,
+            parallel_tool_calls=False,
+        )
+        if self.reasoning_effort:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        try:
+            return await self.client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if "reasoning_effort" not in kwargs or "reasoning" not in str(exc).lower():
+                raise
+            self.log("model", f"this model rejected reasoning_effort, dropping it: {exc}")
+            self.reasoning_effort = None
+            kwargs.pop("reasoning_effort")
+            return await self.client.chat.completions.create(**kwargs)
 
     # ---------- the loop ----------
 
     async def run(self, goal: str, max_steps: int) -> Mission:
         mission = Mission(goal=goal, max_steps=max_steps, running=True)
         self.mission = mission
+        self.finish_questioned = False
         cal = self.robot.cal
         self.messages = [
             {
@@ -419,12 +475,7 @@ class Agent:
                     break
                 mission.steps += 1
                 self._prune_images()
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.messages,
-                    tools=TOOLS,
-                    parallel_tool_calls=False,
-                )
+                response = await self._ask()
                 usage = getattr(response, "usage", None)
                 if usage:
                     mission.tokens_in += usage.prompt_tokens or 0
@@ -463,12 +514,17 @@ class Agent:
                                     },
                                     {
                                         "type": "image_url",
-                                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{b64}",
+                                            "detail": self.image_detail,
+                                        },
                                     },
                                 ],
                             }
                         )
-                    if call.function.name == "finish":
+                    # Only a finish that was accepted ends the mission: an
+                    # early one is answered with "keep going" instead.
+                    if call.function.name == "finish" and mission.finished_summary:
                         mission.running = False
         except asyncio.CancelledError:
             self.log("stop", "mission cancelled")

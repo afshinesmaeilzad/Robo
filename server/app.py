@@ -32,6 +32,8 @@ load_dotenv()
 ROBOT_HOST = os.getenv("ROBOT_HOST", "192.168.4.1")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 PICTURE_SIZE = os.getenv("PICTURE_SIZE", "qvga")
+IMAGE_DETAIL = os.getenv("IMAGE_DETAIL", "low")        # low | high | auto
+REASONING = os.getenv("REASONING_EFFORT", "") or None  # none | minimal | low | ...
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data"))
 # Rough prices per million tokens, for the estimate on the dashboard only.
 # Check what your account is actually charged; set these in .env.
@@ -58,6 +60,8 @@ agent = Agent(
     on_event=lambda kind, text: events.append({"t": time.time(), "kind": kind, "text": text}),
     picture_size=PICTURE_SIZE,
     index=index,
+    image_detail=IMAGE_DETAIL,
+    reasoning_effort=REASONING,
 )
 task: asyncio.Task | None = None
 
@@ -108,6 +112,8 @@ async def state():
         "robot_host": ROBOT_HOST,
         "model": MODEL,
         "key_loaded": client is not None,
+        "detail": IMAGE_DETAIL,
+        "reasoning": REASONING or "default",
         "pose": vars(robot.pose),
         "trail": [vars(p) for p in robot.trail[-200:]],
         "notes": [n.as_text() for n in memory.notes[-30:]],
@@ -270,7 +276,8 @@ async function tick(){
   try {
     const s = await (await fetch('/api/state')).json();
     const m = s.mission;
-    $('status').textContent = `· ${s.model} · robot ${s.robot_host}` +
+    $('status').textContent = `· ${s.model} (detail ${s.detail}, reasoning ${s.reasoning})` +
+      ` · robot ${s.robot_host}` +
       (s.key_loaded ? '' : ' · NO API KEY') +
       ` · index ${s.index_size} views` +
       (m ? ` · ${m.running ? 'running' : 'idle'} step ${m.steps}/${m.max_steps}` +

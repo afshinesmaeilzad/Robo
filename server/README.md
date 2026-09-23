@@ -87,11 +87,11 @@ difference hash of its structure, plus a colour histogram. Comparing those takes
 microseconds and needs no model, so before anything goes to OpenAI the server
 can answer two questions:
 
-- **"Is this the same view I already sent?"** At 97% similar or above, the
+- **"Is this the same view I already sent?"** At 95% similar or above, the
   picture is *not* sent again. The model gets a line of text instead: the view
   has not changed, and the note made there. A robot that is stuck against a
   chair therefore costs a few tokens per step instead of a picture per step.
-- **"Have I been here before?"** At 80% or above, the notes made at those
+- **"Have I been here before?"** At 90% or above, the notes made at those
   earlier views are added as text, so the model is told it is going in circles
   and can use what it learned last time.
 
@@ -108,7 +108,7 @@ under load: the command is sent, the position estimate moves, and the robot
 stays exactly where it was.
 
 The server catches this with the same fingerprints: after a move of 300 ms or
-more, if the new picture is **98.5% or more** the same as the one before it, the
+more, if the new picture is **95% or more** the same as the one before it, the
 robot did not actually move. The server then drives an escape by itself —
 **back 600 ms, then turn 500 ms**, turning the other way each time so it doesn't
 repeat the same escape — takes a fresh picture, and tells the model what
@@ -142,6 +142,12 @@ pictures are dropped from the conversation, so cost per step stays flat.
 from, and every picture is kept in `data/snapshots/`. Notes are loaded at
 startup, so later missions can recall what earlier ones found.
 
+**Keep going.** A model told "stop when you get there" tends to stop at the
+first glimpse of the target. If `finish()` is called having driven less than
+150 cm, and less than a third of the steps are used, the server questions it once
+("you have driven only N cm; unless you are blocked, keep going") and obeys a
+second, insistent call.
+
 **Safety.** One move is capped at 2 s, a mission at `max_steps` (40 by default),
 and the robot stops by itself 0.5 s after the last command, so a crashed or
 disconnected server leaves the robot standing still rather than driving away.
@@ -164,13 +170,23 @@ picture is a few hundred tokens. `PICTURE_SIZE=qqvga` and a smaller `max_steps`
 keep a mission cheap while you experiment, and unchanged views cost text rather
 than an image.
 
+Pictures are sent at **low detail** by default (`IMAGE_DETAIL=low`): a fixed,
+small token cost, and enough to see a floor, a doorway or a chair leg. `high`
+costs several times more for detail this robot does not need.
+
+On a model that thinks before answering, `REASONING_EFFORT` (none | minimal |
+low | medium | high) trades thinking for speed and cost. `none` suits driving:
+the pictures do the work. A model that does not take the setting is detected and
+the setting dropped, rather than the mission failing.
+
 The dashboard shows tokens in (and how many of those were cached), tokens out,
-seconds per step and an estimated price. The prices come from `.env` and default
-to `gpt-4.1-mini`'s — $0.40 per million in, $0.10 cached, $1.60 out. It is an
-estimate for comparing missions, not your bill.
+seconds per step and an estimated price. **Set the prices in `.env` to match the
+model you are running** — they are just numbers for the estimate, and the
+defaults are `gpt-4.1-mini`'s.
 
 Measured on real missions with `gpt-4.1-mini` at 320×240: about 8 seconds per
-step, nearly all of it model latency rather than the robot.
+step, nearly all of it model latency rather than the robot. With low detail a
+picture costs roughly 85 tokens instead of several hundred.
 
 ## Testing
 

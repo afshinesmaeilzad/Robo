@@ -201,6 +201,35 @@ async def main() -> int:
     m3 = await agent3.run("nudge test", max_steps=5)
     checks.append(("short nudge is not 'stuck'", m3.stuck_events == 0, str(m3.stuck_events)))
 
+    # --- an early finish is questioned once, then obeyed ---
+    events.clear()
+    tmp4 = Path(tempfile.mkdtemp())
+    robot4 = FakeRobot(Calibration(cm_per_sec=20, deg_per_sec=180, speed=255))
+    agent4 = Agent(robot4, Memory(tmp4),
+                   StubModel([("Done already.", [tool_call("1", "finish", summary="early")]),
+                              ("Fine, more.", [tool_call("2", "follow_path",
+                                                         steps=[{"direction": "f", "ms": 2000}],
+                                                         purpose="go on")]),
+                              ("Now done.", [tool_call("3", "finish", summary="proper")])]),
+                   "stub", lambda k, t: events.append((k, t)), index=VisionIndex(tmp4))
+    m4 = await agent4.run("explore", max_steps=40)
+    checks.append(("early finish questioned", any(k == "keep-going" for k, t in events),
+                   str([k for k, _ in events])))
+    checks.append(("mission carried on", m4.steps == 3, str(m4.steps)))
+    checks.append(("second finish obeyed", m4.finished_summary == "proper",
+                   str(m4.finished_summary)))
+
+    # ... but a finish late in a mission is obeyed at once
+    events.clear()
+    tmp5 = Path(tempfile.mkdtemp())
+    robot5 = FakeRobot(Calibration(cm_per_sec=20, deg_per_sec=180, speed=255))
+    agent5 = Agent(robot5, Memory(tmp5),
+                   StubModel([("Enough.", [tool_call("1", "finish", summary="late")])]),
+                   "stub", lambda k, t: events.append((k, t)), index=VisionIndex(tmp5))
+    m5 = await agent5.run("explore", max_steps=2)  # step 1 of 2 is not "early"
+    checks.append(("late finish obeyed at once", m5.finished_summary == "late",
+                   str(m5.finished_summary)))
+
     failed = 0
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"  (got {detail})"))
