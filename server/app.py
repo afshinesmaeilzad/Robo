@@ -37,9 +37,9 @@ REASONING = os.getenv("REASONING_EFFORT", "") or None  # none | minimal | low | 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data"))
 # Rough prices per million tokens, for the estimate on the dashboard only.
 # Check what your account is actually charged; set these in .env.
-PRICE_IN = float(os.getenv("PRICE_IN_PER_M", "0.40"))
-PRICE_CACHED = float(os.getenv("PRICE_CACHED_PER_M", "0.10"))
-PRICE_OUT = float(os.getenv("PRICE_OUT_PER_M", "1.60"))
+PRICE_IN = float(os.getenv("PRICE_IN_PER_M", "0.10"))
+PRICE_CACHED = float(os.getenv("PRICE_CACHED_PER_M", "0.01"))
+PRICE_OUT = float(os.getenv("PRICE_OUT_PER_M", "0.50"))
 CAL = Calibration(
     cm_per_sec=float(os.getenv("CM_PER_SEC", "20")),
     deg_per_sec=float(os.getenv("DEG_PER_SEC", "180")),

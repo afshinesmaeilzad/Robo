@@ -181,8 +181,9 @@ the setting dropped, rather than the mission failing.
 
 The dashboard shows tokens in (and how many of those were cached), tokens out,
 seconds per step and an estimated price. **Set the prices in `.env` to match the
-model you are running** — they are just numbers for the estimate, and the
-defaults are `gpt-4.1-mini`'s.
+model you are running**; the defaults are `gpt-6-luna`'s — $0.10 per million in,
+$0.01 cached, $0.50 out. Cache *writes* ($0.125/M) are not reported by the API,
+so they are missing from the estimate and the real bill runs slightly higher.
 
 Measured on real missions with `gpt-4.1-mini` at 320×240: about 8 seconds per
 step, nearly all of it model latency rather than the robot. With low detail a
