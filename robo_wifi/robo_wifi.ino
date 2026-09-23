@@ -31,6 +31,10 @@ const char *AP_PASS = "robo12345";
 #define HOME_SSID "iPhone"
 #define HOME_PASS "afshines1371"
 const uint32_t JOIN_TIMEOUT_MS = 15000;
+// After falling back to our own network, try the home network again this often.
+// A phone hotspot comes and goes (and drops to 5 GHz, which this chip cannot
+// see), so the robot should rejoin by itself rather than need a reset.
+const uint32_t REJOIN_EVERY_MS = 60000;
 
 // Full transmit power: a solid link matters more than battery life. Lower
 // values (8.5 and 13 dBm) were tried to save current and made the link slow
@@ -768,6 +772,28 @@ void startWiFi() {
   if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
 }
 
+// While running on our own network with nobody connected, keep an eye out for
+// the home network coming back.
+void retryHomeWiFi() {
+  static uint32_t lastTry = 0;
+  if (joinedHome || strlen(HOME_SSID) == 0) return;
+  if (WiFi.softAPgetStationNum() > 0) return;  // somebody is driving: leave it alone
+  if (millis() - lastTry < REJOIN_EVERY_MS) return;
+  lastTry = millis();
+  int n = WiFi.scanNetworks();
+  bool visible = false;
+  for (int i = 0; i < n; i++)
+    if (WiFi.SSID(i) == HOME_SSID) visible = true;
+  WiFi.scanDelete();
+  if (!visible) return;  // still not there; stay on our own network
+  Serial.printf("[%lu ms] \"%s\" is back: joining it\n", millis(), HOME_SSID);
+  httpd_stop(server);
+  server = NULL;
+  WiFi.softAPdisconnect(true);
+  startWiFi();
+  startServer();
+}
+
 // ---------- main ----------
 
 void setup() {
@@ -835,6 +861,7 @@ void cameraSelfTest() {
 
 void loop() {
   if (Serial.available() && Serial.read() == 'p') cameraSelfTest();
+  retryHomeWiFi();
   // Read in reverse of the write order (time, then targets) since commands arrive on another core
   bool active = targetLeft || targetRight;
   uint32_t last = lastCmdMs;
