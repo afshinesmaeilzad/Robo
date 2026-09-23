@@ -230,6 +230,35 @@ async def main() -> int:
     checks.append(("late finish obeyed at once", m5.finished_summary == "late",
                    str(m5.finished_summary)))
 
+    # --- mission modes: a target mission sends every picture, explore skips ---
+    from agent import mode_for
+    guesses = {
+        "Explore the room, map it and avoid obstacles.": "explore",
+        "find the red ball and go to it": "target",
+        "follow the cat": "target",
+        "map the corridor": "explore",
+    }
+    ok = all(mode_for(g) == want for g, want in guesses.items())
+    checks.append(("mission mode guessed from the goal", ok,
+                   str({g: mode_for(g) for g in guesses})))
+
+    events.clear()
+    tmp6 = Path(tempfile.mkdtemp())
+    robot6 = FakeRobot(Calibration(), frozen=True)  # identical view every time
+    agent6 = Agent(robot6, Memory(tmp6),
+                   StubModel([("Look.", [tool_call("1", "look", reason="a")]),
+                              ("Again.", [tool_call("2", "look", reason="b")]),
+                              ("Done.", [tool_call("3", "finish", summary="found it")])]),
+                   "stub", lambda k, t: events.append((k, t)), index=VisionIndex(tmp6))
+    m6 = await agent6.run("find the red ball", max_steps=5)
+    checks.append(("target mission picked", m6.mode == "target", m6.mode))
+    checks.append(("target mission sends both identical views", m6.images_sent == 2,
+                   str(m6.images_sent)))
+    checks.append(("target mission skips nothing", m6.images_skipped == 0,
+                   str(m6.images_skipped)))
+    checks.append(("target mission may finish early", m6.finished_summary == "found it",
+                   str(m6.finished_summary)))
+
     failed = 0
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"  (got {detail})"))

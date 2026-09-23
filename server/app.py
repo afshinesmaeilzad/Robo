@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
-from agent import Agent
+from agent import Agent, mode_for
 from discover import find_robot
 from memory import Memory
 from robot import Calibration, FakeRobot, Robot, RobotError
@@ -69,6 +69,9 @@ task: asyncio.Task | None = None
 class StartRequest(BaseModel):
     goal: str = "Explore the room, map it and avoid obstacles."
     max_steps: int = 40
+    # explore = map it, skipping unchanged pictures; target = send every picture;
+    # auto = decide from the wording of the goal
+    mode: str = "auto"
 
 
 @app.post("/api/start")
@@ -78,8 +81,9 @@ async def start(req: StartRequest):
         raise HTTPException(400, "No OPENAI_API_KEY. Put it in server/.env and restart.")
     if task and not task.done():
         raise HTTPException(409, "A mission is already running.")
-    task = asyncio.create_task(agent.run(req.goal, req.max_steps))
-    return {"started": True, "goal": req.goal}
+    mode = req.mode if req.mode in ("explore", "target") else mode_for(req.goal)
+    task = asyncio.create_task(agent.run(req.goal, req.max_steps, mode))
+    return {"started": True, "goal": req.goal, "mode": mode}
 
 
 @app.post("/api/stop")
@@ -122,6 +126,7 @@ async def state():
         if not m
         else {
             "goal": m.goal,
+            "mode": m.mode,
             "running": m.running,
             "steps": m.steps,
             "max_steps": m.max_steps,
@@ -222,6 +227,11 @@ button{cursor:pointer}button.go{background:#2a7}button.stop{background:#a33}
 <div>
   <div class="row">
     <input id="goal" value="Explore the room, map it and avoid obstacles.">
+    <select id="mode" title="Explore saves pictures by skipping unchanged views. Target sends every picture.">
+      <option value="auto" selected>auto</option>
+      <option value="explore">explore &amp; map</option>
+      <option value="target">find a target</option>
+    </select>
     <button class="go" onclick="start()">Start</button>
     <button class="stop" onclick="stop()">Stop</button>
   </div>
@@ -248,7 +258,7 @@ async function post(url, body){
                              body: body ? JSON.stringify(body) : null});
   if (!r.ok) alert((await r.json()).detail || r.statusText);
 }
-const start = () => post('/api/start', {goal: $('goal').value});
+const start = () => post('/api/start', {goal: $('goal').value, mode: $('mode').value});
 const stop = () => post('/api/stop');
 const drive = (d) => post('/api/drive?direction=' + d + '&ms=400');
 function refresh(fresh){ $('cam').src = '/api/picture?t=' + Date.now() + (fresh ? '&fresh=1' : ''); }
@@ -280,7 +290,7 @@ async function tick(){
       ` · robot ${s.robot_host}` +
       (s.key_loaded ? '' : ' · NO API KEY') +
       ` · index ${s.index_size} views` +
-      (m ? ` · ${m.running ? 'running' : 'idle'} step ${m.steps}/${m.max_steps}` +
+      (m ? ` · ${m.mode} · ${m.running ? 'running' : 'idle'} step ${m.steps}/${m.max_steps}` +
            ` · ${m.pictures} pictures, ${m.images_sent} sent, ${m.images_skipped} skipped` +
            (m.stuck_events ? ` · stuck ${m.stuck_events}x` : '') +
            ` · ${(m.tokens_in/1000).toFixed(0)}k in (${(m.tokens_cached/1000).toFixed(0)}k cached)` +

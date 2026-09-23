@@ -447,11 +447,13 @@ finds. The server keeps the robot's estimated position (dead reckoning from the
 commands it sent) and its memory of earlier runs, so the model can plan several
 moves from one picture instead of looking after every step.
 
-Before a picture is sent to OpenAI the server fingerprints it locally (a
-difference hash plus a colour histogram) and compares it with everything seen
-before. An unchanged view is never sent twice — the model is told in one line of
-text — and a familiar place arrives with the notes made there. That keeps both
-the token bill and the WiFi traffic down.
+There are two kinds of mission. When **exploring and mapping**, the server
+fingerprints each picture locally (a difference hash plus a colour histogram) and
+never sends an unchanged view twice — the model is told in one line of text —
+while a familiar place arrives with the notes made there, which keeps the token
+bill and the WiFi traffic down. When **finding or following a target**, every
+picture is sent in full, because the target moves and small changes are the whole
+point. The mode is chosen on the dashboard, or read from the wording of the goal.
 
 The same fingerprints catch a stuck robot: if the view does not change after a
 move, the wheels are blocked, so the server backs it out, turns it and tells the

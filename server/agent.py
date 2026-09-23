@@ -30,12 +30,9 @@ from vision_index import (FAMILIAR, SAME_VIEW, STUCK_VIEW, Shot, VisionIndex,
 # reads "stop when you get there" literally tends to stop at the first glimpse.
 MIN_TRAVEL_CM = 150
 
-SYSTEM_PROMPT = """You are driving a small two-wheel robot with a camera, exploring an indoor room.
+BASE_PROMPT = """You are driving a small two-wheel robot with a camera around an indoor space.
 
-Your goals, in order:
-1. Do not crash. The robot has no bumper or distance sensor: the camera is all you have.
-2. Explore the space and build up a picture of it.
-3. Remember what you find (rooms, furniture, doors, obstacles, dead ends) with remember().
+Rule one: do not crash. The robot has no bumper or distance sensor: the camera is all you have.
 
 How the robot moves:
 - "f"/"b" drive forward/back, "l"/"r" spin in place, "fl"/"fr"/"bl"/"br" curve.
@@ -43,41 +40,61 @@ How the robot moves:
   a 1000 ms spin is roughly {deg_per_sec:.0f} degrees. These are estimates, not exact.
 - The camera looks forward and low. Something close and large in the picture is an
   obstacle. The floor in the lower half of the picture is the path ahead.
-
-Working method:
-- Take a picture with look(), then plan SEVERAL moves from it with follow_path().
-  Pictures are costly, so do not look after every small move.
-- COVER GROUND. When the floor ahead is clearly open, send several long steps at
-  once: follow_path with 3-6 steps of 1000-2000 ms. Crossing a room or a corridor
-  takes tens of seconds of driving, not one short nudge. Short 300-500 ms steps
-  are only for tight spots and fine aiming.
-- To go through a doorway or down a corridor: turn to face it, check the picture,
-  then drive through it in one long path rather than stopping every few
-  centimetres.
 - Before driving forward, be sure the floor ahead is clear in the last picture.
   If you are unsure, spin a little and look again instead of driving blind.
 - The server tells you the estimated position after every move. It drifts, so
   trust the picture over the numbers.
-- Call remember() whenever you see something worth keeping: a room, a doorway, a
-  large object, a blocked path. Use recall() before exploring somewhere you may
-  have been before.
-- The server compares every new picture with the ones it already has, on this
-  machine. If a view has not changed it tells you so instead of sending the
-  picture again, and if a view looks like somewhere you have been it shows you
-  the notes made there. Trust those hints: they mean you are going in circles.
 - If the robot is blocked, the server notices (the view does not change after a
   move), backs it out and turns it. You are told when that happens: pick a
   different direction, do not push the same way again.
 - "Robot problem" messages are usually a brief WiFi hiccup, not a broken robot.
   Try the same thing again, or take a picture; only give up if several attempts
   in a row fail.
+
+Be brief in your reasoning. Prefer acting to explaining."""
+
+EXPLORE_PROMPT = """
+This mission is EXPLORING AND MAPPING.
+
+- Cover ground. When the floor ahead is clearly open, send several long steps at
+  once: follow_path with 3-6 steps of 1000-2000 ms. Crossing a room or a corridor
+  takes tens of seconds of driving, not one short nudge. Short 300-500 ms steps
+  are only for tight spots and fine aiming.
+- To go through a doorway or down a corridor: turn to face it, check the picture,
+  then drive through it in one long path rather than stopping every few
+  centimetres.
+- Pictures cost money and WiFi, so plan several moves from each one rather than
+  looking after every step.
+- To save more, the server compares each new picture with the ones it has. If the
+  view has not changed it tells you in words instead of sending the picture
+  again, and if a view matches somewhere you have been it shows you the notes
+  made there. Those hints mean you are going in circles.
+- Call remember() for anything worth keeping: a room, a doorway, a large object,
+  a blocked path. Use recall() before exploring somewhere you may have been.
 - Call finish() only when the goal is really met, or you are truly blocked, or
   you have run out of steps. Reaching the entrance of somewhere is not the same
   as having been there: go in, look around and note what is inside first.
   "Stop for a new mission" means stop when the task is done, not at the first
-  glimpse of the target.
+  glimpse of the target."""
 
-Be brief in your reasoning. Prefer acting to explaining."""
+TARGET_PROMPT = """
+This mission is FINDING AND APPROACHING A TARGET.
+
+- Every picture is sent to you in full, because the target can move and small
+  changes matter. Look often: after most moves, and always before closing in.
+- Searching: spin in place in steps of about 400-600 ms, looking after each, to
+  sweep the whole room before driving off. Then move to a new spot and sweep again.
+- Once you can see the target: centre it in the picture by turning, then approach
+  in short steps (300-600 ms), looking each time. It grows in the frame as you
+  get nearer.
+- Close in slowly. Stop while it is still a little ahead: the camera cannot see
+  the ground right in front of the wheels.
+- Do not chase a person or a pet that is moving away, and do not drive at
+  anything breakable or anything that could be hurt. If the target moves, wait
+  and look again rather than charging after it.
+- Call remember() when you find the target, with where it was.
+- Call finish() when you have reached the target and stopped near it, or when you
+  have swept the space and it is not there."""
 
 TOOLS = [
     {
@@ -187,9 +204,18 @@ TOOLS = [
 ]
 
 
+def mode_for(goal: str) -> str:
+    """Guess the kind of mission from how it is worded."""
+    words = goal.lower()
+    hunting = ("find", "look for", "search for", "locate", "follow", "chase",
+               "track", "attack", "fetch", "go to the", "approach", "hunt")
+    return "target" if any(w in words for w in hunting) else "explore"
+
+
 @dataclass
 class Mission:
     goal: str
+    mode: str = "explore"   # explore = map it and save pictures; target = see everything
     max_steps: int = 40
     running: bool = False
     stop_requested: bool = False
@@ -258,6 +284,15 @@ class Agent:
         name = self.memory.save_snapshot(jpeg, f"{pose.x:.0f}_{pose.y:.0f}")
         if self.mission:
             self.mission.pictures += 1
+
+        # A target mission needs every picture: the target moves, and the
+        # difference between "chair" and "chair with the ball behind it" is
+        # exactly what a similarity score throws away.
+        if self.index is not None and self.mission and self.mission.mode == "target":
+            self.index.add(jpeg, name, pose.x, pose.y, pose.heading, sent=True)
+            self.mission.images_sent += 1
+            self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {pose.as_text()}")
+            return "Picture taken, see the next message.", base64.b64encode(jpeg).decode()
 
         if self.index is None:
             self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {pose.as_text()}")
@@ -404,7 +439,8 @@ class Agent:
             m = self.mission
             # Finishing after a few centimetres usually means the goal was read
             # too literally. Push back once; obey if it insists.
-            if (m and m.steps < m.max_steps // 3 and self.robot.pose.distance < MIN_TRAVEL_CM
+            if (m and m.mode == "explore" and m.steps < m.max_steps // 3
+                    and self.robot.pose.distance < MIN_TRAVEL_CM
                     and not self.finish_questioned):
                 self.finish_questioned = True
                 self.log("keep-going", f"finish after only {self.robot.pose.distance:.0f}cm")
@@ -444,18 +480,20 @@ class Agent:
 
     # ---------- the loop ----------
 
-    async def run(self, goal: str, max_steps: int) -> Mission:
-        mission = Mission(goal=goal, max_steps=max_steps, running=True)
+    async def run(self, goal: str, max_steps: int, mode: str = "auto") -> Mission:
+        if mode not in ("explore", "target"):
+            mode = mode_for(goal)
+        mission = Mission(goal=goal, mode=mode, max_steps=max_steps, running=True)
         self.mission = mission
         self.finish_questioned = False
         cal = self.robot.cal
         self.messages = [
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT.format(
+                "content": BASE_PROMPT.format(
                     cm_per_sec=cal.cm_per_sec * cal.speed / 255,
                     deg_per_sec=cal.deg_per_sec * cal.speed / 255,
-                ),
+                ) + (EXPLORE_PROMPT if mode == "explore" else TARGET_PROMPT),
             },
             {
                 "role": "user",
@@ -467,7 +505,7 @@ class Agent:
                 ),
             },
         ]
-        self.log("start", goal)
+        self.log("start", f"[{mode}] {goal}")
         try:
             while mission.running and mission.steps < mission.max_steps:
                 if mission.stop_requested:

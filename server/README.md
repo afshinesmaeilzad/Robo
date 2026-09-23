@@ -80,7 +80,31 @@ live log and the memory, with Start and Stop buttons.
 
 To try the whole thing without hardware, set `ROBOT_HOST=fake` in `.env`.
 
-## Not sending the same picture twice
+## Two kinds of mission
+
+The dashboard has a mode next to the goal, and `auto` reads it from the wording:
+
+| Mode | For | Pictures |
+|---|---|---|
+| **explore & map** | learning the layout of a space | unchanged views are **not** sent again; familiar places arrive as notes |
+| **find a target** | finding, approaching or following something | **every** picture is sent in full |
+
+The difference matters. When mapping, a view that has not changed tells the
+model nothing new, so sending it again is wasted money and WiFi. When looking
+for something, the opposite is true: the target moves, and the difference between
+"a chair" and "a chair with the ball behind it" is exactly what a similarity
+score throws away.
+
+The two modes also get different instructions. Exploring is told to cover ground
+in long runs and not to stop at the first glimpse of the target. A target mission
+is told to sweep the room in small turns, look after most moves, centre the
+target before approaching, close in slowly, and never chase a person or an animal
+or drive at anything breakable.
+
+`auto` picks *find a target* when the goal says find, look for, search, locate,
+follow, track, approach or fetch; otherwise it explores.
+
+## Not sending the same picture twice (exploring)
 
 Every snapshot is fingerprinted **locally** (`vision_index.py`): a 64-bit
 difference hash of its structure, plus a colour histogram. Comparing those takes
@@ -142,7 +166,7 @@ pictures are dropped from the conversation, so cost per step stays flat.
 from, and every picture is kept in `data/snapshots/`. Notes are loaded at
 startup, so later missions can recall what earlier ones found.
 
-**Keep going.** A model told "stop when you get there" tends to stop at the
+**Keep going (exploring only).** A model told "stop when you get there" tends to stop at the
 first glimpse of the target. If `finish()` is called having driven less than
 150 cm, and less than a third of the steps are used, the server questions it once
 ("you have driven only N cm; unless you are blocked, keep going") and obeys a
