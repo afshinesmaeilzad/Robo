@@ -166,6 +166,14 @@ pictures are dropped from the conversation, so cost per step stays flat.
 from, and every picture is kept in `data/snapshots/`. Notes are loaded at
 startup, so later missions can recall what earlier ones found.
 
+**Old notes are hints, not facts.** Notes from earlier runs are handed over with
+their age ("14 min ago") and a warning that the room may have changed since.
+Without that, a target mission reads "bear lamp reached and viewed" and finishes
+on the spot — even after the lamp has been moved. A target mission may only end
+at once if `finish(seen_now=true)` says the target is in the picture just taken;
+otherwise, having taken fewer than 6 pictures or driven less than a metre, the
+server answers: that is one spot, not a search — go and look somewhere else.
+
 **Keep going (exploring only).** A model told "stop when you get there" tends to stop at the
 first glimpse of the target. If `finish()` is called having driven less than
 150 cm, and less than a third of the steps are used, the server questions it once

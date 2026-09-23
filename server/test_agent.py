@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agent import Agent
-from memory import Memory
+from memory import Memory, Note
 from robot import Calibration, FakeRobot
 from vision_index import VisionIndex, similarity, fingerprint
 
@@ -248,7 +248,8 @@ async def main() -> int:
     agent6 = Agent(robot6, Memory(tmp6),
                    StubModel([("Look.", [tool_call("1", "look", reason="a")]),
                               ("Again.", [tool_call("2", "look", reason="b")]),
-                              ("Done.", [tool_call("3", "finish", summary="found it")])]),
+                              ("Done.", [tool_call("3", "finish", summary="found it",
+                                                    seen_now=True)])]),
                    "stub", lambda k, t: events.append((k, t)), index=VisionIndex(tmp6))
     m6 = await agent6.run("find the red ball", max_steps=5)
     checks.append(("target mission picked", m6.mode == "target", m6.mode))
@@ -256,8 +257,46 @@ async def main() -> int:
                    str(m6.images_sent)))
     checks.append(("target mission skips nothing", m6.images_skipped == 0,
                    str(m6.images_skipped)))
-    checks.append(("target mission may finish early", m6.finished_summary == "found it",
-                   str(m6.finished_summary)))
+    checks.append(("seeing the target now ends the mission at once",
+                   m6.finished_summary == "found it", str(m6.finished_summary)))
+
+    # --- a target mission cannot finish on an old note after one look ---
+    events.clear()
+    tmp7 = Path(tempfile.mkdtemp())
+    mem7 = Memory(tmp7)
+    mem7.add(Note(label="bear lamp", description="found it here last time",
+                  x=0, y=0, heading=0))
+    robot7 = FakeRobot(Calibration(cm_per_sec=20, deg_per_sec=180, speed=255))
+    stub7 = StubModel([("Already found it.", [tool_call("1", "look", reason="check")]),
+                              ("It is known.", [tool_call("2", "finish", summary="found earlier")]),
+                              ("Fine, searching.",
+                               [tool_call("3", "follow_path",
+                                          steps=[{"direction": "f", "ms": 2000},
+                                                 {"direction": "f", "ms": 2000},
+                                                 {"direction": "f", "ms": 2000}],
+                                          purpose="search elsewhere")]),
+                              ("Looking.", [tool_call("4", "look", reason="sweep")]),
+                              ("Looking.", [tool_call("5", "look", reason="sweep")]),
+                              ("Looking.", [tool_call("6", "look", reason="sweep")]),
+                              ("Looking.", [tool_call("7", "look", reason="sweep")]),
+                              ("Not here.", [tool_call("8", "finish", summary="really not there")])])
+    agent7 = Agent(robot7, mem7, stub7,
+                   "stub", lambda k, t: events.append((k, t)), index=VisionIndex(tmp7))
+    m7 = await agent7.run("find the bear lamp", max_steps=12)
+    checks.append(("old note does not end a target mission",
+                   any(k == "keep-going" for k, t in events), str([k for k, _ in events])))
+    checks.append(("it had to search first", m7.finished_summary == "really not there",
+                   str(m7.finished_summary)))
+    checks.append(("searching moved the robot",
+                   robot7.pose.distance - 0 > 100, f"{robot7.pose.distance:.0f}cm"))
+
+    # notes are handed over with their age and a warning
+    first = stub7.seen[0] if stub7.seen else []
+    opening = next((m["content"] for m in first if m.get("role") == "user"), "")
+    checks.append(("notes are dated for the model", "min ago" in opening or "just now" in opening,
+                   opening[:120]))
+    checks.append(("notes are flagged as possibly stale", "out of date" in opening,
+                   opening[:120]))
 
     failed = 0
     for name, ok, detail in checks:

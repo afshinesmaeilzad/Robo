@@ -24,10 +24,21 @@ class Note:
     image: str | None = None
     t: float = field(default_factory=time.time)
 
-    def as_text(self) -> str:
+    def age(self) -> str:
+        secs = max(0, time.time() - self.t)
+        if secs < 90:
+            return "just now"
+        if secs < 3600:
+            return f"{secs / 60:.0f} min ago"
+        if secs < 86400:
+            return f"{secs / 3600:.0f} h ago"
+        return f"{secs / 86400:.0f} days ago"
+
+    def as_text(self, with_age: bool = False) -> str:
         where = f"at x={self.x:.0f}cm y={self.y:.0f}cm"
         tags = f" [{', '.join(self.tags)}]" if self.tags else ""
-        return f"{self.label}{tags} {where}: {self.description}"
+        when = f" ({self.age()})" if with_age else ""
+        return f"{self.label}{tags} {where}{when}: {self.description}"
 
 
 class Memory:
@@ -75,7 +86,7 @@ class Memory:
         scored.sort(key=lambda s: (s[0], s[1].t), reverse=True)
         return [n for _, n in scored[:limit]]
 
-    def summary(self, limit: int = 20) -> str:
+    def summary(self, limit: int = 20, with_age: bool = False) -> str:
         if not self.notes:
             return "Nothing remembered yet."
-        return "\n".join(n.as_text() for n in self.notes[-limit:])
+        return "\n".join(n.as_text(with_age) for n in self.notes[-limit:])

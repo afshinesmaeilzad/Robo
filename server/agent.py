@@ -29,6 +29,10 @@ from vision_index import (FAMILIAR, SAME_VIEW, STUCK_VIEW, Shot, VisionIndex,
 # Below this much travel, an early finish() is questioned once: a model that
 # reads "stop when you get there" literally tends to stop at the first glimpse.
 MIN_TRAVEL_CM = 150
+# A target mission that stops after a few pictures from one spot has not searched:
+# it has usually just believed an old note.
+MIN_TARGET_LOOKS = 6
+MIN_SEARCH_CM = 100
 
 BASE_PROMPT = """You are driving a small two-wheel robot with a camera around an indoor space.
 
@@ -84,6 +88,11 @@ This mission is FINDING AND APPROACHING A TARGET.
   changes matter. Look often: after most moves, and always before closing in.
 - Searching: spin in place in steps of about 400-600 ms, looking after each, to
   sweep the whole room before driving off. Then move to a new spot and sweep again.
+- Search the WHOLE picture each time, not just the middle: the target is often
+  small, near the floor, at the edge of the frame, or half behind furniture. Say
+  what you can see of it before deciding it is not there.
+- If something might be the target but is too small or too dark to be sure, drive
+  a little closer and look again before ruling it out.
 - Once you can see the target: centre it in the picture by turning, then approach
   in short steps (300-600 ms), looking each time. It grows in the frame as you
   get nearer.
@@ -92,9 +101,20 @@ This mission is FINDING AND APPROACHING A TARGET.
 - Do not chase a person or a pet that is moving away, and do not drive at
   anything breakable or anything that could be hurt. If the target moves, wait
   and look again rather than charging after it.
+- Notes from earlier runs are HINTS ABOUT WHERE TO LOOK, never proof. Things get
+  moved, including by the person who set you this task. A note saying the target
+  was found before does not mean it is there now.
+- Only say you have found the target if you can SEE IT IN THE PICTURE YOU JUST
+  TOOK. Describe where it is in that frame. If you cannot see it, you have not
+  found it, whatever your notes say.
+- Search properly: sweep from where you are, and if the target is not there,
+  DRIVE to another part of the room (1-2 m, several long steps) and sweep again.
+  Turning on the spot only ever shows you one place. Cover several places before
+  concluding it is not there.
 - Call remember() when you find the target, with where it was.
-- Call finish() when you have reached the target and stopped near it, or when you
-  have swept the space and it is not there."""
+- Call finish(seen_now=true) when the target is in the picture you just took and
+  you have stopped near it. Use finish(seen_now=false) only after searching
+  several places without finding it."""
 
 TOOLS = [
     {
@@ -196,7 +216,16 @@ TOOLS = [
             "description": "End the mission.",
             "parameters": {
                 "type": "object",
-                "properties": {"summary": {"type": "string"}},
+                "properties": {
+                    "summary": {"type": "string"},
+                    "seen_now": {
+                        "type": "boolean",
+                        "description": (
+                            "Target missions: true only if the target is visible in the "
+                            "picture you have just taken. An earlier note is not seeing it."
+                        ),
+                    },
+                },
                 "required": ["summary"],
             },
         },
@@ -245,6 +274,8 @@ class Agent:
         index: VisionIndex | None = None,
         image_detail: str = "low",
         reasoning_effort: str | None = None,
+        target_picture_size: str = "vga",
+        target_image_detail: str = "high",
     ):
         self.robot = robot
         self.memory = memory
@@ -256,6 +287,11 @@ class Agent:
         # "low" sends the picture at a fixed small token cost: enough to see a
         # floor, a doorway or a chair leg, and far cheaper than "high".
         self.image_detail = image_detail
+        # Looking FOR something needs a good look at it. At low detail the model
+        # gets a heavily downscaled picture: enough to see whether the floor is
+        # clear, nowhere near enough to recognise a small object across a room.
+        self.target_picture_size = target_picture_size
+        self.target_image_detail = target_image_detail
         self.reasoning_effort = reasoning_effort  # e.g. "none" on models that think
         self.index = index
         self.mission: Mission | None = None
@@ -264,9 +300,15 @@ class Agent:
         self.last_change: float = 0.0   # how alike the last two pictures were
         self.escape_turn = "r"          # alternates, so escapes don't repeat
         self.finish_questioned = False  # an early finish is questioned once
+        self.start_distance = 0.0       # how far the robot had driven when this mission began
         self.messages: list[dict[str, Any]] = []
 
     # ---------- helpers ----------
+
+    def detail_now(self) -> str:
+        if self.mission and self.mission.mode == "target":
+            return self.target_image_detail
+        return self.image_detail
 
     def log(self, kind: str, text: str) -> None:
         self.on_event(kind, text)
@@ -278,7 +320,10 @@ class Agent:
         with what the model has already seen is local work, sending it again is
         not. Familiar places come with the notes made there.
         """
-        jpeg = await self.robot.picture(self.picture_size)
+        hunting = bool(self.mission and self.mission.mode == "target")
+        jpeg = await self.robot.picture(
+            self.target_picture_size if hunting else self.picture_size
+        )
         self.last_jpeg = jpeg
         pose = self.robot.pose
         name = self.memory.save_snapshot(jpeg, f"{pose.x:.0f}_{pose.y:.0f}")
@@ -439,6 +484,23 @@ class Agent:
             m = self.mission
             # Finishing after a few centimetres usually means the goal was read
             # too literally. Push back once; obey if it insists.
+            # Seeing the target now is a good reason to stop. Believing an old
+            # note after two looks from one spot is not.
+            if (m and m.mode == "target" and not args.get("seen_now")
+                    and not self.finish_questioned
+                    and (m.pictures < MIN_TARGET_LOOKS
+                         or self.robot.pose.distance - self.start_distance < MIN_SEARCH_CM)):
+                self.finish_questioned = True
+                moved = self.robot.pose.distance - self.start_distance
+                self.log("keep-going",
+                         f"finish after {m.pictures} pictures and {moved:.0f}cm of searching")
+                return (
+                    f"You have taken {m.pictures} pictures and driven {moved:.0f} cm. That is "
+                    "one spot, not a search, and an earlier note is not proof: the target may "
+                    "have been moved since. Unless you can see the target in the picture you "
+                    "just took, drive to another part of the room and sweep again from there. "
+                    "Call finish() again if you truly cannot find it."
+                ), None
             if (m and m.mode == "explore" and m.steps < m.max_steps // 3
                     and self.robot.pose.distance < MIN_TRAVEL_CM
                     and not self.finish_questioned):
@@ -486,6 +548,7 @@ class Agent:
         mission = Mission(goal=goal, mode=mode, max_steps=max_steps, running=True)
         self.mission = mission
         self.finish_questioned = False
+        self.start_distance = self.robot.pose.distance
         cal = self.robot.cal
         self.messages = [
             {
@@ -500,8 +563,12 @@ class Agent:
                 "content": (
                     f"Goal: {goal}\n\n"
                     f"Starting position: {self.robot.pose.as_text()}\n"
-                    f"What you remember so far:\n{self.memory.summary()}\n\n"
-                    "Start by looking around."
+                    f"Notes from earlier runs (they may be out of date; the room and the "
+                    f"things in it can have been moved since):\n"
+                    f"{self.memory.summary(with_age=True)}\n\n"
+                    + ("Those notes are hints about where to look. Trust only what you "
+                       "see in the pictures you take now.\n\n" if mode == "target" else "")
+                    + "Start by looking around."
                 ),
             },
         ]
@@ -554,7 +621,7 @@ class Agent:
                                         "type": "image_url",
                                         "image_url": {
                                             "url": f"data:image/jpeg;base64,{b64}",
-                                            "detail": self.image_detail,
+                                            "detail": self.detail_now(),
                                         },
                                     },
                                 ],

@@ -33,6 +33,10 @@ ROBOT_HOST = os.getenv("ROBOT_HOST", "192.168.4.1")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 PICTURE_SIZE = os.getenv("PICTURE_SIZE", "qvga")
 IMAGE_DETAIL = os.getenv("IMAGE_DETAIL", "low")        # low | high | auto
+# Finding something needs to actually see it, so target missions get bigger,
+# sharper pictures. At gpt-6-luna's prices that is fractions of a cent.
+TARGET_PICTURE_SIZE = os.getenv("TARGET_PICTURE_SIZE", "vga")
+TARGET_IMAGE_DETAIL = os.getenv("TARGET_IMAGE_DETAIL", "high")
 REASONING = os.getenv("REASONING_EFFORT", "") or None  # none | minimal | low | ...
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data"))
 # Rough prices per million tokens, for the estimate on the dashboard only.
@@ -62,6 +66,8 @@ agent = Agent(
     index=index,
     image_detail=IMAGE_DETAIL,
     reasoning_effort=REASONING,
+    target_picture_size=TARGET_PICTURE_SIZE,
+    target_image_detail=TARGET_IMAGE_DETAIL,
 )
 task: asyncio.Task | None = None
 
@@ -116,7 +122,7 @@ async def state():
         "robot_host": ROBOT_HOST,
         "model": MODEL,
         "key_loaded": client is not None,
-        "detail": IMAGE_DETAIL,
+        "detail": agent.detail_now(),
         "reasoning": REASONING or "default",
         "pose": vars(robot.pose),
         "trail": [vars(p) for p in robot.trail[-200:]],
