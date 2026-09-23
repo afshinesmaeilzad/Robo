@@ -298,6 +298,19 @@ async def main() -> int:
     checks.append(("notes are flagged as possibly stale", "out of date" in opening,
                    opening[:120]))
 
+    # --- running out of steps says so ---
+    events.clear()
+    tmp8 = Path(tempfile.mkdtemp())
+    robot8 = FakeRobot(Calibration())
+    busy = [("Still going.", [tool_call(str(i), "look", reason="again")]) for i in range(10)]
+    agent8 = Agent(robot8, Memory(tmp8), StubModel(busy), "stub",
+                   lambda k, t: events.append((k, t)), index=VisionIndex(tmp8))
+    m8 = await agent8.run("explore forever", max_steps=3)
+    checks.append(("out of steps is explained", "ran out of steps" in m8.ended, m8.ended))
+    checks.append(("and the end event says it",
+                   any(k == "end" and "ran out of steps" in t for k, t in events),
+                   str([t for k, t in events if k == "end"])))
+
     failed = 0
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"  (got {detail})"))

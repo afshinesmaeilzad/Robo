@@ -259,6 +259,7 @@ class Mission:
     started: float = field(default_factory=time.time)
     finished_summary: str | None = None
     error: str | None = None
+    ended: str = ""  # why it stopped, in plain words
 
 
 class Agent:
@@ -579,6 +580,16 @@ class Agent:
                     self.log("stop", "stopped by the user")
                     break
                 mission.steps += 1
+                left = mission.max_steps - mission.steps
+                if left in (5, 2):
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            f"{left} steps left before this mission is stopped. Finish what "
+                            "you are doing: if you can see the target or have something worth "
+                            "keeping, remember() it now and call finish()."
+                        ),
+                    })
                 self._prune_images()
                 response = await self._ask()
                 usage = getattr(response, "usage", None)
@@ -638,11 +649,25 @@ class Agent:
             mission.error = str(exc)
             self.log("error", str(exc))
         finally:
+            if mission.stop_requested:
+                mission.ended = "stopped by you"
+            elif mission.error:
+                mission.ended = f"error: {mission.error}"
+            elif mission.finished_summary:
+                mission.ended = "the model called finish()"
+            elif mission.steps >= mission.max_steps:
+                mission.ended = (
+                    f"ran out of steps ({mission.max_steps}). Raise the step limit and "
+                    "start again to carry on."
+                )
+            else:
+                mission.ended = "stopped"
             mission.running = False
             try:
                 await self.robot.stop()
             except RobotError:
                 pass
             self.memory.save()
-            self.log("end", mission.finished_summary or mission.error or "mission over")
+            self.log("end", f"{mission.ended}"
+                            + (f" - {mission.finished_summary}" if mission.finished_summary else ""))
         return mission

@@ -74,7 +74,7 @@ task: asyncio.Task | None = None
 
 class StartRequest(BaseModel):
     goal: str = "Explore the room, map it and avoid obstacles."
-    max_steps: int = 40
+    max_steps: int = 60
     # explore = map it, skipping unchanged pictures; target = send every picture;
     # auto = decide from the wording of the goal
     mode: str = "auto"
@@ -152,6 +152,7 @@ async def state():
             "seconds": round(time.time() - m.started),
             "summary": m.finished_summary,
             "error": m.error,
+            "ended": m.ended,
         },
         "events": list(events)[-80:],
     }
@@ -233,6 +234,7 @@ button{cursor:pointer}button.go{background:#2a7}button.stop{background:#a33}
 <div>
   <div class="row">
     <input id="goal" value="Explore the room, map it and avoid obstacles.">
+    <input id="steps" type="number" min="5" max="300" value="60" style="width:70px" title="How many steps before the mission is stopped">
     <select id="mode" title="Explore saves pictures by skipping unchanged views. Target sends every picture.">
       <option value="auto" selected>auto</option>
       <option value="explore">explore &amp; map</option>
@@ -264,7 +266,8 @@ async function post(url, body){
                              body: body ? JSON.stringify(body) : null});
   if (!r.ok) alert((await r.json()).detail || r.statusText);
 }
-const start = () => post('/api/start', {goal: $('goal').value, mode: $('mode').value});
+const start = () => post('/api/start', {goal: $('goal').value, mode: $('mode').value,
+                                         max_steps: +$('steps').value});
 const stop = () => post('/api/stop');
 const drive = (d) => post('/api/drive?direction=' + d + '&ms=400');
 function refresh(fresh){ $('cam').src = '/api/picture?t=' + Date.now() + (fresh ? '&fresh=1' : ''); }
@@ -296,7 +299,8 @@ async function tick(){
       ` · robot ${s.robot_host}` +
       (s.key_loaded ? '' : ' · NO API KEY') +
       ` · index ${s.index_size} views` +
-      (m ? ` · ${m.mode} · ${m.running ? 'running' : 'idle'} step ${m.steps}/${m.max_steps}` +
+      (m ? ` · ${m.mode} · ${m.running ? 'running' : `idle (${m.ended || 'not started'})`}` +
+           ` step ${m.steps}/${m.max_steps}` +
            ` · ${m.pictures} pictures, ${m.images_sent} sent, ${m.images_skipped} skipped` +
            (m.stuck_events ? ` · stuck ${m.stuck_events}x` : '') +
            ` · ${(m.tokens_in/1000).toFixed(0)}k in (${(m.tokens_cached/1000).toFixed(0)}k cached)` +

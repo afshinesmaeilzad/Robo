@@ -180,7 +180,14 @@ first glimpse of the target. If `finish()` is called having driven less than
 ("you have driven only N cm; unless you are blocked, keep going") and obeys a
 second, insistent call.
 
-**Safety.** One move is capped at 2 s, a mission at `max_steps` (40 by default),
+**Ending.** The dashboard says why a mission stopped: the model called finish(),
+you pressed Stop, an error, or it ran out of steps. The step box next to the goal
+sets that limit (60 by default) — a target mission that has to search a whole
+room needs more than a quick tour of one. Five steps from the end, and again at
+two, the model is told how little is left so it can wrap up rather than being cut
+off mid-approach.
+
+**Safety.** One move is capped at 2 s, a mission at `max_steps` (60 by default),
 and the robot stops by itself 0.5 s after the last command, so a crashed or
 disconnected server leaves the robot standing still rather than driving away.
 Stop ends the mission at the next step.
