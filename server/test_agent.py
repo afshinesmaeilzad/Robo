@@ -319,7 +319,8 @@ async def main() -> int:
 
         async def info(self):
             d = await super().info()
-            d.update({"sonar": 1, "dist": self.cm, "blocked": 0 < self.cm < 20})
+            d.update({"sonar": 1, "dist": self.cm, "blocked": 0 < self.cm < 20,
+                      "sonarpaused": 0})
             return d
 
     events.clear()
@@ -335,7 +336,22 @@ async def main() -> int:
     checks.append(("close range is reported as too close", "TOO CLOSE" in replies,
                    replies[:160]))
     checks.append(("dashboard gets the reading",
-                   agent9.last_sonar == {"cm": 15, "blocked": True}, str(agent9.last_sonar)))
+                   agent9.last_sonar == {"cm": 15, "blocked": True, "paused": False},
+                   str(agent9.last_sonar)))
+
+    # with the light on, the robot says it cannot range rather than going quiet
+    class LitRobot(SonarRobot):
+        async def info(self):
+            d = await super().info()
+            d["sonarpaused"] = 1
+            return d
+
+    tmp12 = Path(tempfile.mkdtemp())
+    agent12 = Agent(LitRobot(30), Memory(tmp12), StubModel([]), "stub",
+                    lambda k, t: None, index=VisionIndex(tmp12))
+    note = await agent12._sonar_note()
+    checks.append(("light on: range finder says it is paused", "paused while the light" in note,
+                   note[:100]))
 
     events.clear()
     tmp10 = Path(tempfile.mkdtemp())

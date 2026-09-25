@@ -426,10 +426,13 @@ class Agent:
     async def _sonar_note(self) -> str:
         """What the range finder sees, as one line for the model (empty if none)."""
         try:
-            cm, blocked = await self.robot.sonar()
+            cm, blocked, paused = await self.robot.sonar()
         except RobotError:
             return ""
-        self.last_sonar = {"cm": cm, "blocked": blocked}
+        self.last_sonar = {"cm": cm, "blocked": blocked, "paused": paused}
+        if paused:
+            return (" Range finder: paused while the light is on (they share a pin). "
+                    "Turn the light off to see distances again.")
         if cm < 0:
             return ""  # no sensor fitted, or nothing within its 4 m range
         if blocked:

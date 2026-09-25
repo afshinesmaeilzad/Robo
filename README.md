@@ -130,8 +130,14 @@ pins. The motors take 12–15, IO0 is the camera clock and IO16 is the PSRAM chi
 select, so **IO2 and IO4** are all that is left. (GPIO 33 exists on the chip but
 is not on the header — it drives the little red LED.)
 
-IO4 is the flash LED, and the sensor shares it: a trigger pulse is 10 µs, far too
-short to light the LED, and ranging pauses whenever the flash is deliberately on.
+IO4 is the flash LED, and the sensor shares it. Both still work:
+
+- **Ranging does not light the LED.** A trigger pulse is 10 µs, ten times a
+  second — 0.01% duty, far too brief to see.
+- **The flash still works.** While it is deliberately lit, ranging pauses; the
+  robot reports `sonarpaused` and tells the driver "paused while the light is on"
+  rather than quietly going blind. Leave the Light **off** while driving and you
+  have distances the whole time.
 
 | HC-SR04 | ESP32-CAM | Note |
 |---|---|---|

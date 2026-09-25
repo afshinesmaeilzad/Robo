@@ -381,7 +381,13 @@ int measureDistance() {
 // Called from loop(): measure, and stop the wheels if we are about to hit something
 void updateDistance() {
   static uint32_t lastPing = 0;
-  if (flashOn) { distanceCm = -1; return; }  // the trigger pin is busy lighting the LED
+  // The trigger pin is the LED pin: while the light is deliberately on, the
+  // robot cannot range. It also must not keep an old reading and pretend.
+  if (flashOn) {
+    distanceCm = -1;
+    blockedAhead = false;
+    return;
+  }
   if (millis() - lastPing < PING_EVERY_MS) return;
   lastPing = millis();
   int cm = measureDistance();
@@ -697,13 +703,13 @@ static esp_err_t infoHandler(httpd_req_t *req) {
            "{\"up\":%lu,\"boots\":%lu,\"reset\":\"%s\",\"ch\":%d,\"rssi\":%d,\"clients\":%d,\"heap\":%lu,"
            "\"home\":%d,\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,"
            "\"picms\":%lu,\"flash\":%d,\"usedflash\":%d,\"bright\":%d,"
-           "\"dist\":%d,\"blocked\":%d,\"sonar\":%d}",
+           "\"dist\":%d,\"blocked\":%d,\"sonar\":%d,\"sonarpaused\":%d}",
            (unsigned long)(millis() / 1000), (unsigned long)bootCount, resetReason(), apChannel,
            rssi, WiFi.softAPgetStationNum(), (unsigned long)ESP.getMinFreeHeap(),
            joinedHome ? 1 : 0, camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
            (unsigned long)lastPicBytes, (unsigned long)lastPicMs,
            flashMode, lastUsedFlash ? 1 : 0, lastBrightness,
-           distanceCm, blockedAhead ? 1 : 0, sonarSeen ? 1 : 0);
+           distanceCm, blockedAhead ? 1 : 0, sonarSeen ? 1 : 0, flashOn ? 1 : 0);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_sendstr(req, out);

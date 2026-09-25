@@ -190,12 +190,17 @@ class Robot:
     async def light(self, on: bool) -> None:
         await self._http.get(f"http://{self.host}/set", params={"led": 1 if on else 0})
 
-    async def sonar(self) -> tuple[int, bool]:
-        """(distance in cm, blocked). (-1, False) when no range finder is fitted."""
+    async def sonar(self) -> tuple[int, bool, bool]:
+        """(distance cm, blocked, paused). cm is -1 with no sensor or no echo.
+
+        Paused means the flash LED is on: it shares the trigger pin, so the robot
+        cannot range while the light is lit.
+        """
         data = await self.info()
         if not data.get("sonar"):
-            return -1, False
-        return int(data.get("dist", -1)), bool(data.get("blocked"))
+            return -1, False, False
+        return (int(data.get("dist", -1)), bool(data.get("blocked")),
+                bool(data.get("sonarpaused")))
 
     async def info(self) -> dict:
         try:
