@@ -58,7 +58,12 @@ const int FLASH_LED = 4;
 // ECHO is 5 V, so it comes in through a divider: 1k in series, 2k to ground.
 const int TRIG_PIN = 4;   // shared with FLASH_LED
 const int ECHO_PIN = 2;
+// The trigger shares the flash LED's pin, and that LED is bright enough that
+// even a 10 us pulse shows as a faint blink. So ping ten times a second only
+// while actually driving forward, where it is a safety matter, and once a
+// second otherwise just to keep /info honest.
 const uint32_t PING_EVERY_MS = 100;
+const uint32_t PING_IDLE_MS = 1000;
 const int STOP_CM = 20;   // do not drive forward closer than this
 const int CLOSE_CM = 45;  // "something is coming up" for the driver
 const uint32_t PING_TIMEOUT_US = 25000;  // ~4 m, the sensor's limit
@@ -388,7 +393,8 @@ void updateDistance() {
     blockedAhead = false;
     return;
   }
-  if (millis() - lastPing < PING_EVERY_MS) return;
+  bool goingForward = targetLeft > 0 && targetRight > 0;
+  if (millis() - lastPing < (goingForward ? PING_EVERY_MS : PING_IDLE_MS)) return;
   lastPing = millis();
   int cm = measureDistance();
   distanceCm = cm;
