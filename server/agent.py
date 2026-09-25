@@ -32,6 +32,7 @@ MIN_TRAVEL_CM = 150
 # A target mission that stops after a few pictures from one spot has not searched:
 # it has usually just believed an old note.
 MIN_TARGET_LOOKS = 6
+CLOSE_AHEAD_CM = 45  # under this, the range finder is worth mentioning
 MIN_SEARCH_CM = 100
 
 BASE_PROMPT = """You are driving a small two-wheel robot with a camera around an indoor space.
@@ -44,6 +45,11 @@ How the robot moves:
   a 1000 ms spin is roughly {deg_per_sec:.0f} degrees. These are estimates, not exact.
 - The camera looks forward and low. Something close and large in the picture is an
   obstacle. The floor in the lower half of the picture is the path ahead.
+- If a range finder is fitted, you are told how far the nearest thing straight
+  ahead is after every move. It sees what the camera cannot: anything closer than
+  about 30 cm, and low things below the camera's view. Under 20 cm the robot
+  refuses to drive forward at all, so turn or back away first. It only looks
+  straight ahead: a clear reading says nothing about the sides.
 - Before driving forward, be sure the floor ahead is clear in the last picture.
   If you are unsure, spin a little and look again instead of driving blind.
 - The server tells you the estimated position after every move. It drifts, so
@@ -299,6 +305,7 @@ class Agent:
         self.last_jpeg: bytes | None = None
         self.last_shot: Shot | None = None
         self.last_change: float = 0.0   # how alike the last two pictures were
+        self.last_sonar: dict | None = None  # last range reading, for the dashboard
         self.escape_turn = "r"          # alternates, so escapes don't repeat
         self.finish_questioned = False  # an early finish is questioned once
         self.start_distance = 0.0       # how far the robot had driven when this mission began
@@ -416,9 +423,26 @@ class Agent:
             "Do not push the same way again: pick another direction."
         )
 
+    async def _sonar_note(self) -> str:
+        """What the range finder sees, as one line for the model (empty if none)."""
+        try:
+            cm, blocked = await self.robot.sonar()
+        except RobotError:
+            return ""
+        self.last_sonar = {"cm": cm, "blocked": blocked}
+        if cm < 0:
+            return ""  # no sensor fitted, or nothing within its 4 m range
+        if blocked:
+            return (f" Range finder: {cm} cm ahead - TOO CLOSE, the robot refuses to drive "
+                    "forward until you turn or back away.")
+        if cm < CLOSE_AHEAD_CM:
+            return f" Range finder: {cm} cm ahead - close, turn or move in small steps."
+        return f" Range finder: {cm} cm of clear space ahead."
+
     async def _look_after_move(self, moved_ms: int) -> tuple[str, str | None]:
         """Picture after a move, with a stuck check when the move was long enough."""
         text, b64 = await self._take_picture()
+        text += await self._sonar_note()
         real_move = moved_ms >= 300  # shorter nudges may genuinely change nothing
         if real_move and self.last_change >= STUCK_VIEW:
             escape = await self._escape()

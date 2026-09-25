@@ -190,6 +190,13 @@ class Robot:
     async def light(self, on: bool) -> None:
         await self._http.get(f"http://{self.host}/set", params={"led": 1 if on else 0})
 
+    async def sonar(self) -> tuple[int, bool]:
+        """(distance in cm, blocked). (-1, False) when no range finder is fitted."""
+        data = await self.info()
+        if not data.get("sonar"):
+            return -1, False
+        return int(data.get("dist", -1)), bool(data.get("blocked"))
+
     async def info(self) -> dict:
         try:
             r = await self._http.get(f"http://{self.host}/info")

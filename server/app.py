@@ -125,6 +125,7 @@ async def state():
         "detail": agent.detail_now(),
         "reasoning": REASONING or "default",
         "pose": vars(robot.pose),
+        "sonar": agent.last_sonar,
         "trail": [vars(p) for p in robot.trail[-200:]],
         "notes": [n.as_text() for n in memory.notes[-30:]],
         "index_size": len(index.shots),
@@ -298,6 +299,8 @@ async function tick(){
     $('status').textContent = `· ${s.model} (detail ${s.detail}, reasoning ${s.reasoning})` +
       ` · robot ${s.robot_host}` +
       (s.key_loaded ? '' : ' · NO API KEY') +
+      (s.sonar && s.sonar.cm >= 0
+        ? ` · ${s.sonar.blocked ? '⛔' : '📏'} ${s.sonar.cm}cm ahead` : '') +
       ` · index ${s.index_size} views` +
       (m ? ` · ${m.mode} · ${m.running ? 'running' : `idle (${m.ended || 'not started'})`}` +
            ` step ${m.steps}/${m.max_steps}` +

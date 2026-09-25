@@ -48,6 +48,18 @@ const int RIGHT_IN1 = 13;
 const int RIGHT_IN2 = 12;
 const int FLASH_LED = 4;
 
+// HC-SR04 ultrasonic range finder, optional: it sees the things the camera
+// cannot, which is everything closer than about 30 cm and below its view.
+// GPIO 2 (SD card data, unused here) and GPIO 33 (the board's red LED) are the
+// only pins the camera and motors leave free.
+// ECHO is 5 V: feed it through a divider, 1k in series and 2k to ground.
+const int TRIG_PIN = 2;
+const int ECHO_PIN = 33;
+const uint32_t PING_EVERY_MS = 100;
+const int STOP_CM = 20;   // do not drive forward closer than this
+const int CLOSE_CM = 45;  // "something is coming up" for the driver
+const uint32_t PING_TIMEOUT_US = 25000;  // ~4 m, the sensor's limit
+
 // LEDC channels 2-5 (timers 1-2); the camera uses channel 0 / timer 0 for XCLK
 const int PWM_FREQ = 1000;
 const int PWM_BITS = 8;
@@ -95,6 +107,9 @@ volatile uint32_t lastCmdMs = 0;
 volatile int targetLeft = 0, targetRight = 0;  // set by commands
 int curLeft = 0, curRight = 0;                 // applied by loop() with ramp
 volatile int wsFd = -1;                        // socket of the driving WebSocket
+volatile int distanceCm = -1;                  // -1 = nothing measured (no echo, or no sensor)
+volatile bool sonarSeen = false;               // has the sensor ever answered?
+volatile bool blockedAhead = false;            // too close to drive forward
 
 // Pictures
 bool camReady = false;
@@ -144,8 +159,18 @@ void updateMotors() {
   if (r != curRight) { curRight = r; setMotor(RIGHT_IN1, RIGHT_IN2, r); }
 }
 
+// Forward means both wheels forward: a spin (one each way) is always allowed,
+// since turning away is how the robot gets out of trouble.
+static bool isForward(const char *d) {
+  return !strcmp(d, "f") || !strcmp(d, "fl") || !strcmp(d, "fr");
+}
+
 void applyDirection(const char *d) {
   lastCmdMs = millis();  // before the targets, so loop() never sees a new target with an old time
+  if (blockedAhead && isForward(d)) {
+    drive(0, 0);  // something is within STOP_CM: back up or turn instead
+    return;
+  }
   int s = speed;
   int h = s / 3;  // inner wheel speed on curves
   if      (!strcmp(d, "f"))  drive(s, s);
@@ -332,6 +357,38 @@ document.getElementById('fps').onchange = e => fetch('/set?fps=' + e.target.valu
 let led = 0;
 document.getElementById('led').onclick = () => { led ^= 1; fetch('/set?led=' + led); };
 </script></body></html>)HTML";
+
+// ---------- distance ----------
+
+// One ping, in centimetres, or -1 if nothing came back. Sound covers 58 us per
+// centimetre there and back.
+int measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long us = pulseIn(ECHO_PIN, HIGH, PING_TIMEOUT_US);
+  if (us == 0) return -1;  // no echo: out of range, too soft, or no sensor fitted
+  int cm = us / 58;
+  return (cm < 2 || cm > 400) ? -1 : cm;  // outside the sensor's honest range
+}
+
+// Called from loop(): measure, and stop the wheels if we are about to hit something
+void updateDistance() {
+  static uint32_t lastPing = 0;
+  if (millis() - lastPing < PING_EVERY_MS) return;
+  lastPing = millis();
+  int cm = measureDistance();
+  distanceCm = cm;
+  if (cm > 0) sonarSeen = true;
+  bool tooClose = (cm > 0 && cm < STOP_CM);
+  blockedAhead = tooClose;
+  if (tooClose && targetLeft > 0 && targetRight > 0) {
+    drive(0, 0);  // stop now; the camera would not have seen this
+    Serial.printf("[%lu ms] obstacle %d cm ahead: stopped\n", millis(), cm);
+  }
+}
 
 // ---------- camera ----------
 
@@ -629,12 +686,14 @@ static esp_err_t infoHandler(httpd_req_t *req) {
   snprintf(out, sizeof(out),
            "{\"up\":%lu,\"boots\":%lu,\"reset\":\"%s\",\"ch\":%d,\"rssi\":%d,\"clients\":%d,\"heap\":%lu,"
            "\"home\":%d,\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,"
-           "\"picms\":%lu,\"flash\":%d,\"usedflash\":%d,\"bright\":%d}",
+           "\"picms\":%lu,\"flash\":%d,\"usedflash\":%d,\"bright\":%d,"
+           "\"dist\":%d,\"blocked\":%d,\"sonar\":%d}",
            (unsigned long)(millis() / 1000), (unsigned long)bootCount, resetReason(), apChannel,
            rssi, WiFi.softAPgetStationNum(), (unsigned long)ESP.getMinFreeHeap(),
            joinedHome ? 1 : 0, camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
            (unsigned long)lastPicBytes, (unsigned long)lastPicMs,
-           flashMode, lastUsedFlash ? 1 : 0, lastBrightness);
+           flashMode, lastUsedFlash ? 1 : 0, lastBrightness,
+           distanceCm, blockedAhead ? 1 : 0, sonarSeen ? 1 : 0);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_sendstr(req, out);
@@ -804,6 +863,9 @@ void setup() {
   Serial.printf("Boot: reset reason %s, restarts since power-on %lu\n", resetReason(), (unsigned long)bootCount);
   pinMode(FLASH_LED, OUTPUT);
   digitalWrite(FLASH_LED, LOW);
+  pinMode(TRIG_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  pinMode(ECHO_PIN, INPUT);
 
   camLock = xSemaphoreCreateMutex();
   camReady = initCamera();
@@ -859,8 +921,24 @@ void cameraSelfTest() {
   warmupLog = false;
 }
 
+// Serial "d": ten readings, to check the sensor and its wiring
+void distanceSelfTest() {
+  Serial.println("Distance test: 10 readings");
+  for (int i = 0; i < 10; i++) {
+    int cm = measureDistance();
+    if (cm > 0) Serial.printf("  %d cm\n", cm);
+    else Serial.println("  no echo (out of range, or check TRIG/ECHO wiring and 5V)");
+    delay(300);
+  }
+}
+
 void loop() {
-  if (Serial.available() && Serial.read() == 'p') cameraSelfTest();
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'p') cameraSelfTest();
+    if (c == 'd') distanceSelfTest();
+  }
+  updateDistance();
   retryHomeWiFi();
   // Read in reverse of the write order (time, then targets) since commands arrive on another core
   bool active = targetLeft || targetRight;

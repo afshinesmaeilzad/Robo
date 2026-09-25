@@ -311,6 +311,58 @@ async def main() -> int:
                    any(k == "end" and "ran out of steps" in t for k, t in events),
                    str([t for k, t in events if k == "end"])))
 
+    # --- the range finder's reading reaches the model ---
+    class SonarRobot(FakeRobot):
+        def __init__(self, cm):
+            super().__init__(Calibration())
+            self.cm = cm
+
+        async def info(self):
+            d = await super().info()
+            d.update({"sonar": 1, "dist": self.cm, "blocked": 0 < self.cm < 20})
+            return d
+
+    events.clear()
+    tmp9 = Path(tempfile.mkdtemp())
+    stub9 = StubModel([("Go.", [tool_call("1", "move", direction="f", ms=500)]),
+                       ("Stop.", [tool_call("2", "finish", summary="done", seen_now=True)])])
+    agent9 = Agent(SonarRobot(15), Memory(tmp9), stub9, "stub",
+                   lambda k, t: events.append((k, t)), index=VisionIndex(tmp9))
+    await agent9._take_picture()          # so the move replies with a picture
+    await agent9.run("find the ball", max_steps=4)
+    replies = " ".join(m.get("content", "") for msgs in [stub9.seen[-1]] for m in msgs
+                       if m.get("role") == "tool" and isinstance(m.get("content"), str))
+    checks.append(("close range is reported as too close", "TOO CLOSE" in replies,
+                   replies[:160]))
+    checks.append(("dashboard gets the reading",
+                   agent9.last_sonar == {"cm": 15, "blocked": True}, str(agent9.last_sonar)))
+
+    events.clear()
+    tmp10 = Path(tempfile.mkdtemp())
+    stub10 = StubModel([("Go.", [tool_call("1", "move", direction="f", ms=500)]),
+                        ("Stop.", [tool_call("2", "finish", summary="done", seen_now=True)])])
+    agent10 = Agent(SonarRobot(120), Memory(tmp10), stub10, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp10))
+    await agent10._take_picture()
+    await agent10.run("find the ball", max_steps=4)
+    replies = " ".join(m.get("content", "") for msgs in [stub10.seen[-1]] for m in msgs
+                       if m.get("role") == "tool" and isinstance(m.get("content"), str))
+    checks.append(("clear space is reported", "120 cm of clear space" in replies, replies[:160]))
+
+    # no sensor fitted: nothing is said about range at all
+    events.clear()
+    tmp11 = Path(tempfile.mkdtemp())
+    stub11 = StubModel([("Go.", [tool_call("1", "move", direction="f", ms=500)]),
+                        ("Stop.", [tool_call("2", "finish", summary="done", seen_now=True)])])
+    agent11 = Agent(FakeRobot(Calibration()), Memory(tmp11), stub11, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp11))
+    await agent11._take_picture()
+    await agent11.run("find the ball", max_steps=4)
+    replies = " ".join(m.get("content", "") for msgs in [stub11.seen[-1]] for m in msgs
+                       if m.get("role") == "tool" and isinstance(m.get("content"), str))
+    checks.append(("no sensor, no mention of range", "Range finder" not in replies,
+                   replies[:160]))
+
     failed = 0
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"  (got {detail})"))

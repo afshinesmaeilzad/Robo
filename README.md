@@ -53,6 +53,8 @@ Commands come first: they travel over one always-open WebSocket as tiny messages
 | AA battery holder, 4× (6V) | 1 | Motor power |
 | AA battery holder, 4× (6V), or a USB power bank | 1 | ESP32-CAM power |
 | Jumper wires / breadboard | | |
+| HC-SR04 ultrasonic range finder | 1 | Optional: sees obstacles the camera cannot |
+| 1 kΩ and 2 kΩ resistors | 1 each | Optional: divider for the sensor's 5 V ECHO pin |
 
 ---
 
@@ -117,6 +119,50 @@ About the voltages:
 | L293D pins **4, 5, 12, 13** | GND | |
 | ESP32 pack **+** (4×AA or power bank) | ESP32-CAM **5V** | ESP32 supply |
 | Motor pack **−**, ESP32 pack **−**, ESP32-CAM **GND** | Common GND | **Required** |
+
+### Optional: HC-SR04 range finder
+
+The camera cannot see anything closer than about 30 cm, or anything low in front
+of the wheels. A £2 ultrasonic sensor covers exactly that gap.
+
+Only two pins are free once the camera and motors have taken theirs: **GPIO 2**
+(an SD-card data line, unused here) and **GPIO 33** (the small red LED on the
+back of the board).
+
+| HC-SR04 | ESP32-CAM | Note |
+|---|---|---|
+| VCC | 5V | needs 5 V; see the warning below |
+| GND | GND | |
+| TRIG | **GPIO 2** | |
+| ECHO | **GPIO 33**, through a divider | 1 kΩ in series, 2 kΩ to GND |
+
+```
+ ECHO ──[1k]──┬── GPIO 33
+              │
+            [2k]
+              │
+             GND
+```
+
+The divider turns the sensor's 5 V echo into 5 × 2/(1+2) = **3.3 V**, which the
+ESP32 can take. Putting the 2 kΩ in series instead gives 1.7 V, too low to read
+as HIGH.
+
+> **Power:** the HC-SR04 wants 5 V and tolerates about 5.5 V. From a 4×AA pack
+> (~6 V) put a **1N4007 diode in series** with its VCC, stripe towards the
+> sensor, to drop ~0.7 V. From a USB power bank's 5 V it can be wired directly.
+
+The robot pings ten times a second. Closer than **20 cm** it refuses to drive
+forward at all — turning and reversing still work, because that is how it gets
+out — and it stops the wheels immediately if something appears while it is
+moving. `/info` reports `dist`, `blocked` and `sonar`, the dashboard shows the
+reading, and the AI driver is told the distance after every move.
+
+With no sensor fitted nothing changes: the pings get no echo, and the robot
+drives exactly as before.
+
+To check the wiring, connect USB and send **`d`** in the serial monitor: it
+prints ten readings.
 
 ### How a motor is driven
 
