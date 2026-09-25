@@ -110,9 +110,11 @@ async def drive(direction: str, ms: int = 400):
         raise HTTPException(409, "A mission is running; stop it first.")
     try:
         pose = await robot.move(direction, ms)
+        cm, blocked, paused = await robot.sonar()
+        agent.last_sonar = {"cm": cm, "blocked": blocked, "paused": paused}
     except RobotError as exc:
         raise HTTPException(502, str(exc)) from exc
-    return {"pose": vars(pose)}
+    return {"pose": vars(pose), "sonar": agent.last_sonar}
 
 
 @app.get("/api/state")
