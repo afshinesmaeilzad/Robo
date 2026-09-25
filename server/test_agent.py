@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+
+import httpx
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -378,6 +380,47 @@ async def main() -> int:
                        if m.get("role") == "tool" and isinstance(m.get("content"), str))
     checks.append(("no sensor, no mention of range", "Range finder" not in replies,
                    replies[:160]))
+
+    # --- a dropped packet should not kill a mission ---
+    class FlakyModel(StubModel):
+        """Fails the first two calls the way a lost packet does, then works."""
+
+        def __init__(self, script):
+            super().__init__(script)
+            self.failures = 0
+
+        async def _create(self, **kwargs):
+            if self.failures < 2:
+                self.failures += 1
+                raise httpx.ReadError("")  # stringifies to "", as the real one did
+            return await super()._create(**kwargs)
+
+    events.clear()
+    tmp13 = Path(tempfile.mkdtemp())
+    flaky = FlakyModel([("Carry on.", [tool_call("1", "look", reason="a")]),
+                        ("Done.", [tool_call("2", "finish", summary="survived")])])
+    agent13 = Agent(FakeRobot(Calibration()), Memory(tmp13), flaky, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp13))
+    m13 = await agent13.run("explore", max_steps=8)
+    checks.append(("a hiccup does not end the mission", m13.finished_summary == "survived",
+                   f"{m13.finished_summary} / {m13.error}"))
+    checks.append(("the hiccup is named, not blank",
+                   any(k in ("hiccup", "retry") and "ReadError" in t for k, t in events),
+                   str([t for k, t in events if k in ("hiccup", "retry")])))
+
+    # ...but constant failure still stops, with a reason
+    events.clear()
+    tmp14 = Path(tempfile.mkdtemp())
+
+    class DeadModel(StubModel):
+        async def _create(self, **kwargs):
+            raise httpx.ReadError("")
+
+    agent14 = Agent(FakeRobot(Calibration()), Memory(tmp14), DeadModel([]), "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp14))
+    m14 = await agent14.run("explore", max_steps=8)
+    checks.append(("a dead link ends the mission with a reason",
+                   m14.error and "ReadError" in m14.error, str(m14.error)))
 
     failed = 0
     for name, ok, detail in checks:

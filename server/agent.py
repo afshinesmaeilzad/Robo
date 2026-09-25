@@ -32,6 +32,12 @@ MIN_TRAVEL_CM = 150
 # A target mission that stops after a few pictures from one spot has not searched:
 # it has usually just believed an old note.
 MIN_TARGET_LOOKS = 6
+MAX_HICCUPS = 3  # consecutive failed steps before a mission gives up
+
+
+def why(exc: Exception) -> str:
+    """A message that is never empty: timeouts and read errors stringify to ""."""
+    return str(exc) or type(exc).__name__
 CLOSE_AHEAD_CM = 45  # under this, the range finder is worth mentioning
 MIN_SEARCH_CM = 100
 
@@ -549,7 +555,7 @@ class Agent:
         return f"Unknown tool {name}.", None
 
     async def _ask(self):
-        """One model call. Drops reasoning_effort if this model does not take it."""
+        """One model call, retried briefly. Drops reasoning_effort if unsupported."""
         kwargs = dict(
             model=self.model,
             messages=self.messages,
@@ -559,14 +565,25 @@ class Agent:
         if self.reasoning_effort:
             kwargs["reasoning_effort"] = self.reasoning_effort
         try:
-            return await self.client.chat.completions.create(**kwargs)
+            return await self._create_with_retry(kwargs)
         except Exception as exc:  # noqa: BLE001
             if "reasoning_effort" not in kwargs or "reasoning" not in str(exc).lower():
                 raise
             self.log("model", f"this model rejected reasoning_effort, dropping it: {exc}")
             self.reasoning_effort = None
             kwargs.pop("reasoning_effort")
-            return await self.client.chat.completions.create(**kwargs)
+            return await self._create_with_retry(kwargs)
+
+    async def _create_with_retry(self, kwargs: dict, tries: int = 3):
+        """The link to the internet shares a phone hotspot with the robot."""
+        for attempt in range(tries):
+            try:
+                return await self.client.chat.completions.create(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if attempt == tries - 1 or "reasoning" in str(exc).lower():
+                    raise
+                self.log("retry", f"model call failed ({why(exc)}), trying again")
+                await asyncio.sleep(1.5 * (attempt + 1))
 
     # ---------- the loop ----------
 
@@ -601,6 +618,7 @@ class Agent:
             },
         ]
         self.log("start", f"[{mode}] {goal}")
+        hiccups = 0  # consecutive failed steps: a few are normal on a phone hotspot
         try:
             while mission.running and mission.steps < mission.max_steps:
                 if mission.stop_requested:
@@ -618,7 +636,16 @@ class Agent:
                         ),
                     })
                 self._prune_images()
-                response = await self._ask()
+                try:
+                    response = await self._ask()
+                except Exception as exc:  # noqa: BLE001 - usually a dropped packet
+                    hiccups += 1
+                    self.log("hiccup", f"{why(exc)} (attempt {hiccups} of {MAX_HICCUPS})")
+                    if hiccups >= MAX_HICCUPS:
+                        raise
+                    await asyncio.sleep(2)
+                    continue
+                hiccups = 0
                 usage = getattr(response, "usage", None)
                 if usage:
                     mission.tokens_in += usage.prompt_tokens or 0
@@ -672,9 +699,9 @@ class Agent:
         except asyncio.CancelledError:
             self.log("stop", "mission cancelled")
             raise
-        except Exception as exc:  # noqa: BLE001 - any failure ends the mission safely
-            mission.error = str(exc)
-            self.log("error", str(exc))
+        except Exception as exc:  # noqa: BLE001 - anything else ends the mission safely
+            mission.error = why(exc)
+            self.log("error", why(exc))
         finally:
             if mission.stop_requested:
                 mission.ended = "stopped by you"
