@@ -50,11 +50,14 @@ const int FLASH_LED = 4;
 
 // HC-SR04 ultrasonic range finder, optional: it sees the things the camera
 // cannot, which is everything closer than about 30 cm and below its view.
-// GPIO 2 (SD card data, unused here) and GPIO 33 (the board's red LED) are the
-// only pins the camera and motors leave free.
-// ECHO is 5 V: feed it through a divider, 1k in series and 2k to ground.
-const int TRIG_PIN = 2;
-const int ECHO_PIN = 33;
+// The AI-Thinker header only brings out 5V, GND, IO12-15, IO2, IO4, IO16, IO0
+// and the serial pins. The motors take 12-15, IO0 is the camera clock and IO16
+// is the PSRAM chip select, so IO2 and IO4 are all that is left.
+// TRIG therefore shares IO4 with the flash LED: a trigger pulse is 10 us, far
+// too short to light it, and ranging pauses while the flash is deliberately on.
+// ECHO is 5 V, so it comes in through a divider: 1k in series, 2k to ground.
+const int TRIG_PIN = 4;   // shared with FLASH_LED
+const int ECHO_PIN = 2;
 const uint32_t PING_EVERY_MS = 100;
 const int STOP_CM = 20;   // do not drive forward closer than this
 const int CLOSE_CM = 45;  // "something is coming up" for the driver
@@ -110,6 +113,7 @@ volatile int wsFd = -1;                        // socket of the driving WebSocke
 volatile int distanceCm = -1;                  // -1 = nothing measured (no echo, or no sensor)
 volatile bool sonarSeen = false;               // has the sensor ever answered?
 volatile bool blockedAhead = false;            // too close to drive forward
+volatile bool flashOn = false;                 // flash LED lit: shares the trigger pin
 
 // Pictures
 bool camReady = false;
@@ -377,6 +381,7 @@ int measureDistance() {
 // Called from loop(): measure, and stop the wheels if we are about to hit something
 void updateDistance() {
   static uint32_t lastPing = 0;
+  if (flashOn) { distanceCm = -1; return; }  // the trigger pin is busy lighting the LED
   if (millis() - lastPing < PING_EVERY_MS) return;
   lastPing = millis();
   int cm = measureDistance();
@@ -425,6 +430,7 @@ static camera_fb_t *camCapture(int warmup) {
   lastBrightness = jpegBrightness(fb);
   if (flashMode == 1 || (flashMode == 0 && lastBrightness >= 0 && lastBrightness < DARK_BELOW)) {
     esp_camera_fb_return(fb);
+    flashOn = true;
     digitalWrite(FLASH_LED, HIGH);
     // The first frames are still exposed for the dark: let the camera catch up
     for (int i = 0; i < FLASH_SETTLE_FRAMES; i++) {
@@ -433,6 +439,7 @@ static camera_fb_t *camCapture(int warmup) {
     }
     fb = esp_camera_fb_get();
     digitalWrite(FLASH_LED, LOW);
+    flashOn = false;
     lastUsedFlash = true;
     if (fb) lastBrightness = jpegBrightness(fb);
   }
@@ -643,7 +650,10 @@ static esp_err_t goHandler(httpd_req_t *req) {
 static esp_err_t setHandler(httpd_req_t *req) {
   char v[12];
   if (queryParam(req, "speed", v, sizeof(v))) speed = constrain(atoi(v), 0, 255);
-  if (queryParam(req, "led", v, sizeof(v)))   digitalWrite(FLASH_LED, atoi(v) ? HIGH : LOW);
+  if (queryParam(req, "led", v, sizeof(v))) {
+    flashOn = atoi(v) != 0;
+    digitalWrite(FLASH_LED, flashOn ? HIGH : LOW);
+  }
   if (queryParam(req, "flash", v, sizeof(v))) {
     if (!strcmp(v, "auto")) flashMode = 0;
     else if (!strcmp(v, "on")) flashMode = 1;
@@ -863,7 +873,7 @@ void setup() {
   Serial.printf("Boot: reset reason %s, restarts since power-on %lu\n", resetReason(), (unsigned long)bootCount);
   pinMode(FLASH_LED, OUTPUT);
   digitalWrite(FLASH_LED, LOW);
-  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);   // same pin as the flash LED
   digitalWrite(TRIG_PIN, LOW);
   pinMode(ECHO_PIN, INPUT);
 

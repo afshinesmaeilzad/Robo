@@ -125,19 +125,23 @@ About the voltages:
 The camera cannot see anything closer than about 30 cm, or anything low in front
 of the wheels. A £2 ultrasonic sensor covers exactly that gap.
 
-Only two pins are free once the camera and motors have taken theirs: **GPIO 2**
-(an SD-card data line, unused here) and **GPIO 33** (the small red LED on the
-back of the board).
+The header brings out only 5V, GND, IO12–15, IO2, IO4, IO16, IO0 and the serial
+pins. The motors take 12–15, IO0 is the camera clock and IO16 is the PSRAM chip
+select, so **IO2 and IO4** are all that is left. (GPIO 33 exists on the chip but
+is not on the header — it drives the little red LED.)
+
+IO4 is the flash LED, and the sensor shares it: a trigger pulse is 10 µs, far too
+short to light the LED, and ranging pauses whenever the flash is deliberately on.
 
 | HC-SR04 | ESP32-CAM | Note |
 |---|---|---|
 | VCC | 5V | needs 5 V; see the warning below |
 | GND | GND | |
-| TRIG | **GPIO 2** | |
-| ECHO | **GPIO 33**, through a divider | 1 kΩ in series, 2 kΩ to GND |
+| TRIG | **GPIO 4** | shared with the flash LED |
+| ECHO | **GPIO 2**, through a divider | 1 kΩ in series, 2 kΩ to GND |
 
 ```
- ECHO ──[1k]──┬── GPIO 33
+ ECHO ──[1k]──┬── GPIO 2
               │
             [2k]
               │
