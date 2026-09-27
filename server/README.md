@@ -217,13 +217,37 @@ and the robot stops by itself 0.5 s after the last command, so a crashed or
 disconnected server leaves the robot standing still rather than driving away.
 Stop ends the mission at the next step.
 
+## When the wheels will not turn
+
+As the motor batteries tire, the robot stops moving at speeds that worked
+yesterday — at 200 the wheels may not turn while at 255 they do. Nothing says
+so: the commands are accepted, the position estimate advances, and the robot
+sits still.
+
+So a stall is treated as an obstacle: the view does not change after a move, the
+server backs up, turns, **and raises the speed to 230**, and tells the model the
+wheels may simply have stalled. The prompt says to drive at 200-255 and to crawl
+only for the last few centimetres of an approach.
+
+If it keeps happening, change the motor batteries. No amount of software makes a
+flat cell turn a wheel.
+
 ## Calibration
 
-Dead reckoning is only as good as two numbers in `.env`. Measure them once:
+Dead reckoning is only as good as `CM_PER_SEC` and `DEG_PER_SEC` in `.env`.
 
-1. Open the dashboard and press **▲ forward** (400 ms) a few times, measure the
-   distance travelled, and work out cm per second at your `DRIVE_SPEED`.
-2. Press **spin** several times, count the degrees turned, and do the same.
+With the range finder fitted, the robot can measure its own speed: point it at a
+wall a metre or two away with clear floor between, and press **📐 measure speed**
+(or `POST /api/calibrate`). It drives forward in short bursts, watches the wall
+come closer, and reports cm per second along with the line to put in `.env`.
+
+It takes the median of several runs, because one echo off an angled surface can
+be wildly wrong, and it waits out a full ping between readings — standing still
+the robot only pings once a second, so an immediate answer can describe where it
+was a moment ago.
+
+The turn rate still has to be measured by hand: spin for two seconds and estimate
+the degrees.
 
 The estimate drifts, especially on carpet. It is a hint for the model, not a map.
 

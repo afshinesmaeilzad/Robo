@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -34,7 +35,10 @@ MIN_TRAVEL_CM = 150
 # A target mission that stops after a few pictures from one spot has not searched:
 # it has usually just believed an old note.
 MIN_TARGET_LOOKS = 6
+STALL_SPEED = 230  # tired batteries will not turn the wheels much below this
 MAX_HICCUPS = 3  # consecutive failed steps before a mission gives up
+DITHER_STEPS = 6      # look back this many steps...
+DITHER_CM = 40        # ...and if it has got this far or less, say so
 
 
 def why(exc: Exception) -> str:
@@ -52,10 +56,14 @@ How the robot moves:
 - Moves are measured in milliseconds. A 1000 ms forward move is roughly {cm_per_sec:.0f} cm;
   a 1000 ms spin is roughly {deg_per_sec:.0f} degrees. These are estimates, not exact.
 - set_speed() sets motor power, 80 to 255, and both distances above scale with it.
-  Crawl at 100-140 to close in on something or thread past furniture; 200-255 for
-  open floor. Below about 90 the wheels may not turn at all on carpet.
+  Use 200-255 normally. Crawl at 150-180 only for the last few centimetres of an
+  approach, and go back up afterwards: as the batteries tire the wheels stop
+  turning at all below about 200, and the robot then sits still while thinking it
+  has moved. If a move changes nothing, suspect the speed before the room.
 - The camera looks forward and low. Something close and large in the picture is an
   obstacle. The floor in the lower half of the picture is the path ahead.
+- People and pets are obstacles like any other: pass them at about half a metre
+  and carry on. Never drive into one, but do not retreat from the room either.
 - If a range finder is fitted, you are told how far the nearest thing straight
   ahead is after every move. It sees what the camera cannot: anything closer than
   about 30 cm, and low things below the camera's view. Under 20 cm the robot
@@ -85,6 +93,9 @@ This mission is EXPLORING AND MAPPING.
   once: follow_path with 3-6 steps of 1000-2000 ms. Crossing a room or a corridor
   takes tens of seconds of driving, not one short nudge. Short 300-500 ms steps
   are only for tight spots and fine aiming.
+- move() is for fine aiming and tight spots only. Three move() calls in a row is a
+  sign you are dithering: use follow_path() instead, which costs one picture for a
+  whole path rather than one per nudge.
 - To go through a doorway or down a corridor: turn to face it, check the picture,
   then drive through it in one long path rather than stopping every few
   centimetres.
@@ -120,8 +131,11 @@ This mission is FINDING AND APPROACHING A TARGET.
 - Close in slowly. Stop while it is still a little ahead: the camera cannot see
   the ground right in front of the wheels.
 - Do not chase a person or a pet that is moving away, and do not drive at
-  anything breakable or anything that could be hurt. If the target moves, wait
-  and look again rather than charging after it.
+  anything breakable. If the target moves, wait and look again rather than
+  charging after it.
+- A person or a pet in view is an obstacle to go round, like a chair: keep about
+  half a metre away and steer past. Do not keep reversing away from them, and do
+  not abandon the room because someone is standing in it.
 - Notes from earlier runs are HINTS ABOUT WHERE TO LOOK, never proof. Things get
   moved, including by the person who set you this task. A note saying the target
   was found before does not mean it is there now.
@@ -341,6 +355,8 @@ class Agent:
         self.last_shot: Shot | None = None
         self.last_change: float = 0.0   # how alike the last two pictures were
         self.last_sonar: dict | None = None  # last range reading, for the dashboard
+        self.recent_places: list[tuple[float, float]] = []  # to notice going nowhere
+        self.last_nudge_step = -99
         self.escape_turn = "r"          # alternates, so escapes don't repeat
         self.finish_questioned = False  # an early finish is questioned once
         self.start_distance = 0.0       # how far the robot had driven when this mission began
@@ -376,7 +392,16 @@ class Agent:
         # difference between "chair" and "chair with the ball behind it" is
         # exactly what a similarity score throws away.
         if self.index is not None and self.mission and self.mission.mode == "target":
-            self.index.add(jpeg, name, pose.x, pose.y, pose.heading, sent=True)
+            # Still measure how much the view changed: it is what tells a moving
+            # robot from a stalled one, and a target mission needs that as much
+            # as any other.
+            if self.last_shot is not None:
+                phash, hist = fingerprint(jpeg)
+                self.last_change = similarity(phash, hist,
+                                              self.last_shot.phash, self.last_shot.hist)
+            else:
+                self.last_change = 0.0
+            self.last_shot = self.index.add(jpeg, name, pose.x, pose.y, pose.heading, sent=True)
             self.mission.images_sent += 1
             self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {pose.as_text()}")
             return "Picture taken, see the next message.", base64.b64encode(jpeg).decode()
@@ -426,6 +451,31 @@ class Agent:
             text += "\nThis place looks familiar:\n" + self.index.context(familiar)
         return text, base64.b64encode(jpeg).decode()
 
+    def _nudge_if_dithering(self, mission: Mission) -> None:
+        """Say so when it has spent several steps going nowhere.
+
+        Turning and reversing on the spot feels like progress to a model working
+        one picture at a time; from outside it is obvious that the robot has not
+        been anywhere.
+        """
+        here = (self.robot.pose.x, self.robot.pose.y)
+        self.recent_places.append(here)
+        if len(self.recent_places) <= DITHER_STEPS:
+            return
+        then = self.recent_places[-DITHER_STEPS - 1]
+        moved = math.dist(then, here)
+        if moved > DITHER_CM or mission.steps - self.last_nudge_step < DITHER_STEPS:
+            return
+        self.last_nudge_step = mission.steps
+        self.log("dithering", f"{moved:.0f}cm in {DITHER_STEPS} steps")
+        self.brain.add_user_text(
+            f"You have moved {moved:.0f} cm in the last {DITHER_STEPS} steps: you are "
+            "turning and reversing in one spot, not exploring. Pick the most open "
+            "direction you can see and commit to it with follow_path - several steps "
+            "of 1000-1500 ms at speed 200 or more. If every direction really is "
+            "blocked, say so and finish."
+        )
+
     def _remind(self, mission: Mission) -> None:
         """Put the running plan, position, speed and range at the end of the talk.
 
@@ -456,10 +506,24 @@ class Agent:
     # ---------- tools ----------
 
     async def _escape(self) -> str:
-        """Back out of whatever the robot is caught on and turn away from it."""
+        """Back out of whatever the robot is caught on and turn away from it.
+
+        Often nothing is caught: the batteries have sagged and the wheels will
+        not turn at the speed being asked for, so the escape starts by giving
+        them more power.
+        """
         self.escape_turn = "l" if self.escape_turn == "r" else "r"
         if self.mission:
             self.mission.stuck_events += 1
+        raised = ""
+        if self.robot.cal.speed < STALL_SPEED:
+            try:
+                await self.robot.set_speed(STALL_SPEED)
+                raised = (f" The wheels may simply have stalled at that speed, so I have "
+                          f"raised it to {STALL_SPEED}.")
+                self.log("speed", f"raised to {STALL_SPEED} after a stall")
+            except RobotError:
+                pass
         self.log("stuck", f"view unchanged after moving; backing up and turning {self.escape_turn}")
         try:
             await self.robot.move("b", 600)
@@ -469,8 +533,9 @@ class Agent:
         return (
             "The view did not change after that move, so the robot is stuck: the wheels are "
             "blocked, or it is pressed against something the camera cannot see well. "
-            f"I have backed it up and turned it {'left' if self.escape_turn == 'l' else 'right'}. "
-            "Do not push the same way again: pick another direction."
+            f"I have backed it up and turned it {'left' if self.escape_turn == 'l' else 'right'}."
+            + raised +
+            " Do not push the same way again: pick another direction."
         )
 
     async def _sonar_note(self) -> str:
@@ -500,7 +565,8 @@ class Agent:
         if real_move and self.last_change >= STUCK_VIEW:
             escape = await self._escape()
             text2, b64_2 = await self._take_picture()
-            return f"{escape}\n{text2}", b64_2 or b64
+            # the range reading matters most right after an escape
+            return f"{escape}\n{text2}{await self._sonar_note()}", b64_2 or b64
         return text, b64
 
     # ---------- tools ----------
@@ -624,6 +690,8 @@ class Agent:
         self.mission = mission
         self.finish_questioned = False
         self.start_distance = self.robot.pose.distance
+        self.recent_places = []
+        self.last_nudge_step = -99
         cal = self.robot.cal
         self.brain = make_brain(self.client, self.model, TOOLS, self.reasoning_effort, self.api)
         self.brain.start(
@@ -656,6 +724,7 @@ class Agent:
                         "keeping, remember() it now and call finish()."
                     )
                 self._prune_images()
+                self._nudge_if_dithering(mission)
                 self._remind(mission)
                 try:
                     reply = await self._ask_with_retry()

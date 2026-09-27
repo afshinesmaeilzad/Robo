@@ -588,6 +588,53 @@ async def main() -> int:
     checks.append(("reasoning wanted: responses", isinstance(thinking, ResponsesBrain),
                    type(thinking).__name__))
 
+    # --- going nowhere for several steps gets called out ---
+    events.clear()
+    tmp20 = Path(tempfile.mkdtemp())
+    # spins in place: heading changes, position does not
+    spins = [("Turning.", [tool_call(str(i), "move", direction="l", ms=300)]) for i in range(12)]
+    stub20 = StubModel(spins)
+    agent20 = Agent(FakeRobot(Calibration()), Memory(tmp20), stub20, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp20))
+    await agent20.run("explore the room", max_steps=10)
+    checks.append(("circling in one place is noticed",
+                   any(k == "dithering" for k, t in events), str([k for k, _ in events][-6:])))
+    nudges = [m for m in stub20.seen[-1] if isinstance(m.get("content"), str)
+              and "turning and reversing in one spot" in m["content"]]
+    checks.append(("and the model is told", len(nudges) >= 1, str(len(nudges))))
+
+    # ...but a robot that is actually travelling is left alone
+    events.clear()
+    tmp21 = Path(tempfile.mkdtemp())
+    runs = [("Driving.", [tool_call(str(i), "follow_path",
+                                    steps=[{"direction": "f", "ms": 2000}],
+                                    purpose="go")]) for i in range(12)]
+    agent21 = Agent(FakeRobot(Calibration()), Memory(tmp21), StubModel(runs), "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp21))
+    await agent21.run("explore the room", max_steps=10)
+    checks.append(("a robot that is moving is not nagged",
+                   not any(k == "dithering" for k, t in events),
+                   str([k for k, _ in events][-4:])))
+
+    # --- a stall raises the speed, and target missions notice stalls at all ---
+    events.clear()
+    tmp22 = Path(tempfile.mkdtemp())
+    robot22 = FakeRobot(Calibration(), frozen=True)  # the view never changes: stalled
+    await robot22.set_speed(150)
+    agent22 = Agent(robot22, Memory(tmp22),
+                    StubModel([("Go.", [tool_call("1", "look", reason="a")]),
+                               ("Go.", [tool_call("2", "move", direction="f", ms=800)]),
+                               ("Stop.", [tool_call("3", "finish", summary="x", seen_now=True)])]),
+                    "stub", lambda k, t: events.append((k, t)), index=VisionIndex(tmp22))
+    m22 = await agent22.run("find the ball", max_steps=5)   # a TARGET mission
+    checks.append(("a target mission notices a stall", m22.stuck_events == 1,
+                   str(m22.stuck_events)))
+    checks.append(("the speed is raised after a stall", robot22.cal.speed == 230,
+                   str(robot22.cal.speed)))
+    checks.append(("and the model is told why",
+                   any(k == "speed" and "230" in t for k, t in events),
+                   str([t for k, t in events if k == "speed"])))
+
     failed = 0
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"  (got {detail})"))

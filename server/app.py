@@ -118,6 +118,68 @@ async def drive(direction: str, ms: int = 400):
     return {"pose": vars(pose), "sonar": agent.last_sonar}
 
 
+@app.post("/api/calibrate")
+async def calibrate(ms: int = 1000, runs: int = 3):
+    """Measure how far the robot really travels, using the range finder.
+
+    Point it at a wall 60-200 cm away with clear floor between, and it drives
+    forward in short bursts, watching the distance close. That is a measurement
+    rather than the guess in .env, and everything the model is told about
+    distances depends on it.
+    """
+    if agent.mission and agent.mission.running:
+        raise HTTPException(409, "A mission is running; stop it first.")
+
+    async def fresh() -> tuple[int, bool]:
+        """A reading taken after we asked, not before.
+
+        Standing still the robot pings once a second, so the first answer can
+        describe where it was a moment ago. Waiting past one ping and reading
+        again gives a current one.
+        """
+        await robot.sonar()
+        await asyncio.sleep(1.2)
+        cm, blocked, _ = await robot.sonar()
+        return cm, blocked
+
+    cm_before, blocked = await fresh()
+    if cm_before < 0:
+        raise HTTPException(400, "No range reading. Is the sensor fitted and facing a wall?")
+    if blocked:
+        raise HTTPException(400, f"Only {cm_before} cm ahead: back away from the wall first.")
+
+    measured = []
+    for _ in range(max(1, min(runs, 6))):
+        start, _ = await fresh()
+        if start < 35:
+            break  # close enough to the wall; stop before nosing into it
+        await robot.move("f", ms)
+        end, _ = await fresh()
+        if start > 0 and end > 0 and start > end:
+            measured.append((start - end) / (ms / 1000))
+    if not measured:
+        raise HTTPException(400, "Could not measure: give it a clear metre or two of wall.")
+
+    speed_now = robot.cal.speed
+    # The median, not the mean: one bad echo off an angled surface should not
+    # decide how far the robot thinks it travels.
+    ordered = sorted(measured)
+    per_sec = ordered[len(ordered) // 2]
+    spread = (max(measured) - min(measured)) / per_sec if per_sec and len(measured) > 1 else 0
+    full = per_sec * 255 / speed_now  # .env holds the figure at full power
+    robot.cal.cm_per_sec = full
+    return {
+        "runs": [round(m, 1) for m in measured],
+        "cm_per_sec_at_speed": round(per_sec, 1),
+        "speed": speed_now,
+        "cm_per_sec_full_power": round(full, 1),
+        "spread": round(spread, 2),
+        "trust": "good" if len(measured) >= 3 and spread < 0.4 else
+                 "rough - run it again facing a flat wall",
+        "put_in_env": f"CM_PER_SEC={full:.0f}",
+    }
+
+
 @app.get("/api/state")
 async def state():
     m = agent.mission
@@ -256,6 +318,7 @@ button{cursor:pointer}button.go{background:#2a7}button.stop{background:#a33}
     <button onclick="drive('r')">spin ▶</button>
     <button onclick="refresh(true)">📷 picture</button>
     <button onclick="post('/api/find')">🔎 find robot</button>
+    <button onclick="calibrate()" title="Point at a wall 60-200cm away, then press">📐 measure speed</button>
   </div>
   <canvas id="map" height="320"></canvas>
 </div>
@@ -270,6 +333,12 @@ async function post(url, body){
   const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
                              body: body ? JSON.stringify(body) : null});
   if (!r.ok) alert((await r.json()).detail || r.statusText);
+}
+async function calibrate(){
+  const r = await fetch('/api/calibrate', {method: 'POST'});
+  const d = await r.json();
+  alert(r.ok ? `Measured ${d.cm_per_sec_at_speed} cm/s at speed ${d.speed}.\n` +
+               `Put this in server/.env:  ${d.put_in_env}` : (d.detail || 'failed'));
 }
 const start = () => post('/api/start', {goal: $('goal').value, mode: $('mode').value,
                                          max_steps: +$('steps').value});
