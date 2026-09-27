@@ -142,6 +142,10 @@ Short nudges under 300 ms are exempt: they may genuinely change nothing.
 
 The dashboard counts these as **stuck Nx**.
 
+The range reading goes to the model after every move **and every look**, and the
+step reminder repeats the last one along with the current motor speed, so it
+always knows how much room it has and how fast it is set to move.
+
 ## Memory, short and long
 
 **Within a mission.** The last `KEEP_IMAGES` pictures (6 by default) stay in the
@@ -168,8 +172,10 @@ The model is given these tools:
 | Tool | What it does |
 |---|---|
 | `look(reason)` | takes a picture and shows it to the model |
-| `move(direction, ms)` | one move, then stop — for small corrections |
-| `follow_path(steps, purpose)` | up to 6 moves in a row, then **one** picture |
+| `move(direction, ms, speed)` | one move, then stop — for small corrections |
+| `set_speed(speed)` | motor power 80–255: crawl past furniture, hurry across open floor |
+| `set_plan(plan)` | what it is doing and what comes next, shown back every step |
+| `follow_path(steps, purpose, speed)` | up to 6 moves in a row, then **one** picture |
 | `remember(label, description, tags)` | saves a note with the current position |
 | `recall(query)` | searches earlier notes |
 | `finish(summary)` | ends the mission |

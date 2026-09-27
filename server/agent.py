@@ -49,6 +49,9 @@ How the robot moves:
 - "f"/"b" drive forward/back, "l"/"r" spin in place, "fl"/"fr"/"bl"/"br" curve.
 - Moves are measured in milliseconds. A 1000 ms forward move is roughly {cm_per_sec:.0f} cm;
   a 1000 ms spin is roughly {deg_per_sec:.0f} degrees. These are estimates, not exact.
+- set_speed() sets motor power, 80 to 255, and both distances above scale with it.
+  Crawl at 100-140 to close in on something or thread past furniture; 200-255 for
+  open floor. Below about 90 the wheels may not turn at all on carpet.
 - The camera looks forward and low. Something close and large in the picture is an
   obstacle. The floor in the lower half of the picture is the path ahead.
 - If a range finder is fitted, you are told how far the nearest thing straight
@@ -160,6 +163,10 @@ TOOLS = [
                         "enum": ["f", "b", "l", "r", "fl", "fr", "bl", "br"],
                     },
                     "ms": {"type": "integer", "minimum": 100, "maximum": 2000},
+                    "speed": {
+                        "type": "integer", "minimum": 80, "maximum": 255,
+                        "description": "Optional: use this speed for this move onwards.",
+                    },
                 },
                 "required": ["direction", "ms"],
             },
@@ -192,6 +199,10 @@ TOOLS = [
                         },
                     },
                     "purpose": {"type": "string", "description": "What this path is for."},
+                    "speed": {
+                        "type": "integer", "minimum": 80, "maximum": 255,
+                        "description": "Optional: use this speed for this path onwards.",
+                    },
                 },
                 "required": ["steps"],
             },
@@ -210,6 +221,22 @@ TOOLS = [
                     "tags": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["label", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_speed",
+            "description": (
+                "Motor power, 80 (crawl) to 255 (fast). Slow down to close in on "
+                "something, to squeeze past furniture, or when the range finder says "
+                "the way is tight; speed up to cross open floor."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"speed": {"type": "integer", "minimum": 80, "maximum": 255}},
+                "required": ["speed"],
             },
         },
     },
@@ -429,11 +456,16 @@ class Agent:
         self.messages[:] = [m for m in self.messages if not m.get("_reminder")]
         if not mission.plan:
             return
+        where = [f"You are at {self.robot.pose.as_text()}",
+                 f"motor speed {self.robot.cal.speed} of 255",
+                 f"step {mission.steps} of {mission.max_steps}"]
+        if self.last_sonar and self.last_sonar.get("cm", -1) >= 0:
+            cm = self.last_sonar["cm"]
+            where.insert(1, f"last range reading {cm} cm ahead"
+                            + (" (too close for forward)" if self.last_sonar.get("blocked") else ""))
         self.messages.append({
             "role": "user",
-            "content": (f"Your plan, as you last wrote it: {mission.plan}\n"
-                        f"You are at {self.robot.pose.as_text()}, "
-                        f"step {mission.steps} of {mission.max_steps}."),
+            "content": f"Your plan, as you last wrote it: {mission.plan}\n" + ", ".join(where) + ".",
             "_reminder": True,
         })
 
@@ -505,9 +537,18 @@ class Agent:
         """Returns (text for the model, base64 picture or None)."""
         pose = self.robot.pose
         if name == "look":
-            return await self._take_picture()
+            text, b64 = await self._take_picture()
+            return text + await self._sonar_note(), b64
+
+        if name == "set_speed":
+            await self.robot.set_speed(args["speed"])
+            self.log("speed", f"motors set to {self.robot.cal.speed}")
+            return (f"Motor speed is now {self.robot.cal.speed} of 255. Distances per "
+                    "second scale with it."), None
 
         if name == "move":
+            if args.get("speed"):
+                await self.robot.set_speed(args["speed"])
             await self.robot.move(args["direction"], args["ms"])
             self.log("move", f"{args['direction']} {args['ms']}ms -> {pose.as_text()}")
             if self.last_jpeg is None:  # nothing to compare with yet
@@ -516,6 +557,8 @@ class Agent:
             return f"Moved. Estimated position: {pose.as_text()}. {text}", b64
 
         if name == "follow_path":
+            if args.get("speed"):
+                await self.robot.set_speed(args["speed"])
             steps = args.get("steps", [])
             done = []
             for step in steps:

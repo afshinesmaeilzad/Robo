@@ -183,12 +183,23 @@ class Robot:
                         await asyncio.sleep(0.3)
             raise RobotError(f"no picture from the robot ({last})")
 
+    async def _set(self, **params) -> None:
+        """A /set call that says so when it fails, instead of throwing a bare httpx
+        error up through the mission loop."""
+        try:
+            r = await self._http.get(f"http://{self.host}/set", params=params)
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            raise RobotError(f"could not change {list(params)[0]} "
+                             f"({str(exc) or type(exc).__name__})") from exc
+
     async def set_speed(self, speed: int) -> None:
-        self.cal.speed = max(80, min(int(speed), 255))
-        await self._http.get(f"http://{self.host}/set", params={"speed": self.cal.speed})
+        wanted = max(80, min(int(speed), 255))
+        await self._set(speed=wanted)
+        self.cal.speed = wanted  # only after the robot has taken it
 
     async def light(self, on: bool) -> None:
-        await self._http.get(f"http://{self.host}/set", params={"led": 1 if on else 0})
+        await self._set(led=1 if on else 0)
 
     async def sonar(self) -> tuple[int, bool, bool]:
         """(distance cm, blocked, paused). cm is -1 with no sensor or no echo.
@@ -228,6 +239,9 @@ class FakeRobot(Robot):
         await self._http.aclose()
 
     async def _send(self, text: str) -> None:
+        return
+
+    async def _set(self, **params) -> None:
         return
 
     async def picture(self, size: str | None = None) -> bytes:

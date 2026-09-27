@@ -465,6 +465,42 @@ async def main() -> int:
                    brief[:120]))
     checks.append(("recent notes are there too", "wall 14" in brief, brief[-120:]))
 
+    # --- speed control, and the distance reaching the model ---
+    events.clear()
+    tmp17 = Path(tempfile.mkdtemp())
+    robot17 = SonarRobot(60)
+    stub17 = StubModel([
+        ("Slow down.", [tool_call("1", "set_speed", speed=110)]),
+        ("Creep.", [tool_call("2", "move", direction="f", ms=400)]),
+        ("Open floor.", [tool_call("3", "follow_path",
+                                   steps=[{"direction": "f", "ms": 1500}], speed=240,
+                                   purpose="cross")]),
+        ("Look.", [tool_call("4", "look", reason="check")]),
+        ("Plan.", [tool_call("5", "set_plan", plan="heading for the corridor")]),
+        ("Done.", [tool_call("6", "finish", summary="ok", seen_now=True)]),
+    ])
+    agent17 = Agent(robot17, Memory(tmp17), stub17, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp17))
+    m17 = await agent17.run("find the ball", max_steps=8)
+
+    checks.append(("set_speed reaches the robot", robot17.cal.speed == 240,
+                   str(robot17.cal.speed)))
+    checks.append(("a slow speed was set first",
+                   any(k == "speed" and "110" in t for k, t in events),
+                   str([t for k, t in events if k == "speed"])))
+
+    replies = " ".join(m.get("content", "") for m in stub17.seen[-1]
+                       if m.get("role") == "tool" and isinstance(m.get("content"), str))
+    checks.append(("look reports the distance too", "60 cm of clear space" in replies,
+                   replies[:200]))
+    reminder = next((m["content"] for m in stub17.seen[-1]
+                     if isinstance(m.get("content"), str)
+                     and "Your plan, as you last wrote it" in m["content"]), "")
+    checks.append(("the step reminder carries speed", "motor speed 240" in reminder,
+                   reminder[:160]))
+    checks.append(("the step reminder carries the last range",
+                   "last range reading 60 cm" in reminder, reminder[:160]))
+
     failed = 0
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"  (got {detail})"))
