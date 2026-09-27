@@ -17,9 +17,11 @@ import base64
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Callable
 
 from openai import AsyncOpenAI
+
+from llm import Call, Reply, make_brain
 
 from memory import Memory, Note
 from robot import Robot, RobotError
@@ -137,157 +139,133 @@ This mission is FINDING AND APPROACHING A TARGET.
 
 TOOLS = [
     {
-        "type": "function",
-        "function": {
-            "name": "look",
-            "description": "Take a picture with the robot's camera and look at it.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "Why you need to look now."},
-                },
-                "required": ["reason"],
+        "name": "look",
+        "description": "Take a picture with the robot's camera and look at it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Why you need to look now."},
             },
+            "required": ["reason"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "move",
-            "description": "One move, then stop. Use for small corrections.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "direction": {
-                        "type": "string",
-                        "enum": ["f", "b", "l", "r", "fl", "fr", "bl", "br"],
-                    },
-                    "ms": {"type": "integer", "minimum": 100, "maximum": 2000},
-                    "speed": {
-                        "type": "integer", "minimum": 80, "maximum": 255,
-                        "description": "Optional: use this speed for this move onwards.",
-                    },
+        "name": "move",
+        "description": "One move, then stop. Use for small corrections.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["f", "b", "l", "r", "fl", "fr", "bl", "br"],
                 },
-                "required": ["direction", "ms"],
+                "ms": {"type": "integer", "minimum": 100, "maximum": 2000},
+                "speed": {
+                    "type": "integer", "minimum": 80, "maximum": 255,
+                    "description": "Optional: use this speed for this move onwards.",
+                },
             },
+            "required": ["direction", "ms"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "follow_path",
-            "description": (
-                "Several moves in a row, then one picture. Preferred way to travel: "
-                "it costs one picture instead of one per move."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "steps": {
-                        "type": "array",
-                        "maxItems": 6,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "direction": {
-                                    "type": "string",
-                                    "enum": ["f", "b", "l", "r", "fl", "fr", "bl", "br"],
-                                },
-                                "ms": {"type": "integer", "minimum": 100, "maximum": 2000},
+        "name": "follow_path",
+        "description": (
+            "Several moves in a row, then one picture. Preferred way to travel: "
+            "it costs one picture instead of one per move."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "maxItems": 6,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "direction": {
+                                "type": "string",
+                                "enum": ["f", "b", "l", "r", "fl", "fr", "bl", "br"],
                             },
-                            "required": ["direction", "ms"],
+                            "ms": {"type": "integer", "minimum": 100, "maximum": 2000},
                         },
-                    },
-                    "purpose": {"type": "string", "description": "What this path is for."},
-                    "speed": {
-                        "type": "integer", "minimum": 80, "maximum": 255,
-                        "description": "Optional: use this speed for this path onwards.",
+                        "required": ["direction", "ms"],
                     },
                 },
-                "required": ["steps"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remember",
-            "description": "Keep a note about this place, tied to where the robot is now.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "label": {"type": "string", "description": "Short name, e.g. 'kitchen door'."},
-                    "description": {"type": "string"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
+                "purpose": {"type": "string", "description": "What this path is for."},
+                "speed": {
+                    "type": "integer", "minimum": 80, "maximum": 255,
+                    "description": "Optional: use this speed for this path onwards.",
                 },
-                "required": ["label", "description"],
             },
+            "required": ["steps"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "set_speed",
-            "description": (
-                "Motor power, 80 (crawl) to 255 (fast). Slow down to close in on "
-                "something, to squeeze past furniture, or when the range finder says "
-                "the way is tight; speed up to cross open floor."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"speed": {"type": "integer", "minimum": 80, "maximum": 255}},
-                "required": ["speed"],
+        "name": "remember",
+        "description": "Keep a note about this place, tied to where the robot is now.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Short name, e.g. 'kitchen door'."},
+                "description": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
             },
+            "required": ["label", "description"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "set_plan",
-            "description": (
-                "Write down what you are doing and what comes next. It is shown back to "
-                "you every step, so use it to keep your bearings: what you are looking "
-                "for, where you have searched, which way you were heading. Update it "
-                "whenever the plan changes."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"plan": {"type": "string"}},
-                "required": ["plan"],
-            },
+        "name": "set_speed",
+        "description": (
+            "Motor power, 80 (crawl) to 255 (fast). Slow down to close in on "
+            "something, to squeeze past furniture, or when the range finder says "
+            "the way is tight; speed up to cross open floor."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"speed": {"type": "integer", "minimum": 80, "maximum": 255}},
+            "required": ["speed"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "recall",
-            "description": "Search earlier notes.",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-            },
+        "name": "set_plan",
+        "description": (
+            "Write down what you are doing and what comes next. It is shown back to "
+            "you every step, so use it to keep your bearings: what you are looking "
+            "for, where you have searched, which way you were heading. Update it "
+            "whenever the plan changes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"plan": {"type": "string"}},
+            "required": ["plan"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "finish",
-            "description": "End the mission.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string"},
-                    "seen_now": {
-                        "type": "boolean",
-                        "description": (
-                            "Target missions: true only if the target is visible in the "
-                            "picture you have just taken. An earlier note is not seeing it."
-                        ),
-                    },
+        "name": "recall",
+        "description": "Search earlier notes.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "finish",
+        "description": "End the mission.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "seen_now": {
+                    "type": "boolean",
+                    "description": (
+                        "Target missions: true only if the target is visible in the "
+                        "picture you have just taken. An earlier note is not seeing it."
+                    ),
                 },
-                "required": ["summary"],
             },
+            "required": ["summary"],
         },
     },
 ]
@@ -356,6 +334,8 @@ class Agent:
         self.target_image_detail = target_image_detail
         self.reasoning_effort = reasoning_effort  # e.g. "none" on models that think
         self.index = index
+        self.brain = None  # built per mission: it holds that mission's conversation
+        self.api = "auto"  # auto | chat | responses
         self.mission: Mission | None = None
         self.last_jpeg: bytes | None = None
         self.last_shot: Shot | None = None
@@ -364,7 +344,6 @@ class Agent:
         self.escape_turn = "r"          # alternates, so escapes don't repeat
         self.finish_questioned = False  # an early finish is questioned once
         self.start_distance = 0.0       # how far the robot had driven when this mission began
-        self.messages: list[dict[str, Any]] = []
 
     # ---------- helpers ----------
 
@@ -448,13 +427,13 @@ class Agent:
         return text, base64.b64encode(jpeg).decode()
 
     def _remind(self, mission: Mission) -> None:
-        """Put the running plan at the end of the conversation, not the system prompt.
+        """Put the running plan, position, speed and range at the end of the talk.
 
-        Changing the system prompt each step would invalidate the cached prefix and
-        cost ten times as much; the tail is cheap to change.
+        The tail is cheap to change; the system prompt is not, because changing it
+        would throw away the cached prefix and cost ten times as much per step.
         """
-        self.messages[:] = [m for m in self.messages if not m.get("_reminder")]
         if not mission.plan:
+            self.brain.set_reminder("")
             return
         where = [f"You are at {self.robot.pose.as_text()}",
                  f"motor speed {self.robot.cal.speed} of 255",
@@ -463,25 +442,18 @@ class Agent:
             cm = self.last_sonar["cm"]
             where.insert(1, f"last range reading {cm} cm ahead"
                             + (" (too close for forward)" if self.last_sonar.get("blocked") else ""))
-        self.messages.append({
-            "role": "user",
-            "content": f"Your plan, as you last wrote it: {mission.plan}\n" + ", ".join(where) + ".",
-            "_reminder": True,
-        })
+        self.brain.set_reminder(
+            f"Your plan, as you last wrote it: {mission.plan}\n" + ", ".join(where) + "."
+        )
 
     def _prune_images(self) -> None:
-        """Keep only the newest images; older ones become a line of text."""
-        seen = 0
-        for msg in reversed(self.messages):
-            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
-                continue
-            if not any(p.get("type") == "image_url" for p in msg["content"]):
-                continue
-            seen += 1
-            if seen > self.keep_images:
-                text = next((p["text"] for p in msg["content"] if p.get("type") == "text"), "")
-                # Keep the place and your own description of it: only the pixels go
-                msg["content"] = f"{text} - picture no longer shown; your notes on it stand."
+        """Older pictures lose their pixels but keep their text: where they were
+        taken, and what the model said about them, is the thread of its thinking."""
+        self.brain.prune_images(
+            self.keep_images, "- picture no longer shown; your notes on it stand."
+        )
+
+    # ---------- tools ----------
 
     async def _escape(self) -> str:
         """Back out of whatever the robot is caught on and turn away from it."""
@@ -643,38 +615,6 @@ class Agent:
 
         return f"Unknown tool {name}.", None
 
-    async def _ask(self):
-        """One model call, retried briefly. Drops reasoning_effort if unsupported."""
-        kwargs = dict(
-            model=self.model,
-            messages=[{k: v for k, v in m.items() if not k.startswith("_")}
-                      for m in self.messages],
-            tools=TOOLS,
-            parallel_tool_calls=False,
-        )
-        if self.reasoning_effort:
-            kwargs["reasoning_effort"] = self.reasoning_effort
-        try:
-            return await self._create_with_retry(kwargs)
-        except Exception as exc:  # noqa: BLE001
-            if "reasoning_effort" not in kwargs or "reasoning" not in str(exc).lower():
-                raise
-            self.log("model", f"this model rejected reasoning_effort, dropping it: {exc}")
-            self.reasoning_effort = None
-            kwargs.pop("reasoning_effort")
-            return await self._create_with_retry(kwargs)
-
-    async def _create_with_retry(self, kwargs: dict, tries: int = 3):
-        """The link to the internet shares a phone hotspot with the robot."""
-        for attempt in range(tries):
-            try:
-                return await self.client.chat.completions.create(**kwargs)
-            except Exception as exc:  # noqa: BLE001
-                if attempt == tries - 1 or "reasoning" in str(exc).lower():
-                    raise
-                self.log("retry", f"model call failed ({why(exc)}), trying again")
-                await asyncio.sleep(1.5 * (attempt + 1))
-
     # ---------- the loop ----------
 
     async def run(self, goal: str, max_steps: int, mode: str = "auto") -> Mission:
@@ -685,28 +625,21 @@ class Agent:
         self.finish_questioned = False
         self.start_distance = self.robot.pose.distance
         cal = self.robot.cal
-        self.messages = [
-            {
-                "role": "system",
-                "content": BASE_PROMPT.format(
-                    cm_per_sec=cal.cm_per_sec * cal.speed / 255,
-                    deg_per_sec=cal.deg_per_sec * cal.speed / 255,
-                ) + (EXPLORE_PROMPT if mode == "explore" else TARGET_PROMPT),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Goal: {goal}\n\n"
-                    f"Starting position: {self.robot.pose.as_text()}\n"
-                    f"Notes from earlier runs (they may be out of date; the room and the "
-                    f"things in it can have been moved since):\n"
-                    f"{self.memory.briefing(goal)}\n\n"
-                    + ("Those notes are hints about where to look. Trust only what you "
-                       "see in the pictures you take now.\n\n" if mode == "target" else "")
-                    + "Start by looking around."
-                ),
-            },
-        ]
+        self.brain = make_brain(self.client, self.model, TOOLS, self.reasoning_effort, self.api)
+        self.brain.start(
+            BASE_PROMPT.format(
+                cm_per_sec=cal.cm_per_sec * cal.speed / 255,
+                deg_per_sec=cal.deg_per_sec * cal.speed / 255,
+            ) + (EXPLORE_PROMPT if mode == "explore" else TARGET_PROMPT),
+            f"Goal: {goal}\n\n"
+            f"Starting position: {self.robot.pose.as_text()}\n"
+            f"Notes from earlier runs (they may be out of date; the room and the "
+            f"things in it can have been moved since):\n"
+            f"{self.memory.briefing(goal)}\n\n"
+            + ("Those notes are hints about where to look. Trust only what you "
+               "see in the pictures you take now.\n\n" if mode == "target" else "")
+            + "Start by looking around.",
+        )
         self.log("start", f"[{mode}] {goal}")
         hiccups = 0  # consecutive failed steps: a few are normal on a phone hotspot
         try:
@@ -717,18 +650,15 @@ class Agent:
                 mission.steps += 1
                 left = mission.max_steps - mission.steps
                 if left in (5, 2):
-                    self.messages.append({
-                        "role": "user",
-                        "content": (
-                            f"{left} steps left before this mission is stopped. Finish what "
-                            "you are doing: if you can see the target or have something worth "
-                            "keeping, remember() it now and call finish()."
-                        ),
-                    })
+                    self.brain.add_user_text(
+                        f"{left} steps left before this mission is stopped. Finish what "
+                        "you are doing: if you can see the target or have something worth "
+                        "keeping, remember() it now and call finish()."
+                    )
                 self._prune_images()
                 self._remind(mission)
                 try:
-                    response = await self._ask()
+                    reply = await self._ask_with_retry()
                 except Exception as exc:  # noqa: BLE001 - usually a dropped packet
                     hiccups += 1
                     self.log("hiccup", f"{why(exc)} (attempt {hiccups} of {MAX_HICCUPS})")
@@ -737,55 +667,31 @@ class Agent:
                     await asyncio.sleep(2)
                     continue
                 hiccups = 0
-                usage = getattr(response, "usage", None)
-                if usage:
-                    mission.tokens_in += usage.prompt_tokens or 0
-                    mission.tokens_out += usage.completion_tokens or 0
-                    details = getattr(usage, "prompt_tokens_details", None)
-                    mission.tokens_cached += getattr(details, "cached_tokens", 0) or 0
-                choice = response.choices[0].message
-                self.messages.append(choice.model_dump(exclude_none=True))
-                if choice.content:
-                    self.log("think", choice.content.strip())
-                if not choice.tool_calls:
-                    self.messages.append(
-                        {"role": "user", "content": "Use a tool, or call finish() to stop."}
-                    )
+
+                mission.tokens_in += reply.tokens_in
+                mission.tokens_out += reply.tokens_out
+                mission.tokens_cached += reply.tokens_cached
+                if reply.text:
+                    self.log("think", reply.text.strip())
+                if not reply.calls:
+                    self.brain.add_user_text("Use a tool, or call finish() to stop.")
                     continue
 
-                for call in choice.tool_calls:
-                    args = json.loads(call.function.arguments or "{}")
-                    self.log("tool", f"{call.function.name}({json.dumps(args)[:200]})")
+                for call in reply.calls:
+                    self.log("tool", f"{call.name}({json.dumps(call.args)[:200]})")
                     try:
-                        text, b64 = await self._run_tool(call.function.name, args)
+                        text, b64 = await self._run_tool(call.name, call.args)
                     except RobotError as exc:
                         text, b64 = f"Robot problem: {exc}", None
                         self.log("error", str(exc))
-                    self.messages.append(
-                        {"role": "tool", "tool_call_id": call.id, "content": text}
-                    )
+                    self.brain.add_tool_result(call, text)
                     if b64:
-                        self.messages.append(
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": f"Camera view at {self.robot.pose.as_text()}",
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/jpeg;base64,{b64}",
-                                            "detail": self.detail_now(),
-                                        },
-                                    },
-                                ],
-                            }
+                        self.brain.add_user_image(
+                            f"Camera view at {self.robot.pose.as_text()}", b64, self.detail_now()
                         )
-                    # Only a finish that was accepted ends the mission: an
-                    # early one is answered with "keep going" instead.
-                    if call.function.name == "finish" and mission.finished_summary:
+                    # Only a finish that was accepted ends the mission: an early
+                    # one is answered with "keep going" instead.
+                    if call.name == "finish" and mission.finished_summary:
                         mission.running = False
         except asyncio.CancelledError:
             self.log("stop", "mission cancelled")
@@ -816,3 +722,57 @@ class Agent:
             self.log("end", f"{mission.ended}"
                             + (f" - {mission.finished_summary}" if mission.finished_summary else ""))
         return mission
+
+    async def _ask_with_retry(self, tries: int = 3) -> Reply:
+        """The internet shares a phone hotspot with the robot, so one failed call
+        is not news. A model that refuses reasoning with tools is, though: that
+        one is answered by moving to the API that allows both."""
+        for attempt in range(tries):
+            try:
+                return await self.brain.ask()
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc).lower()
+                if "reasoning" in message and "not supported" in message:
+                    if self.api != "responses" and hasattr(self.client, "responses"):
+                        self.log("model", "this model wants /v1/responses for tools with "
+                                          "reasoning; switching to it")
+                        self.api = "responses"
+                        self._rebuild_brain()
+                        continue
+                    self.log("model", "this model will not think while using tools; "
+                                      "carrying on without reasoning")
+                    self.reasoning_effort = None
+                    self.api = "chat"
+                    self._rebuild_brain()
+                    continue
+                if attempt == tries - 1:
+                    raise
+                self.log("retry", f"model call failed ({why(exc)}), trying again")
+                await asyncio.sleep(1.5 * (attempt + 1))
+        raise RuntimeError("unreachable")
+
+    def _rebuild_brain(self) -> None:
+        """Move the conversation to the other API, keeping what has been said."""
+        old = self.brain
+        fresh = make_brain(self.client, self.model, TOOLS, self.reasoning_effort, self.api)
+        fresh.start(getattr(old, "system", "") or self._system_of(old), self._first_user_of(old))
+        self.brain = fresh
+
+    @staticmethod
+    def _system_of(brain) -> str:
+        for item in brain.items:
+            if item.get("role") == "system":
+                return item.get("content", "")
+        return ""
+
+    @staticmethod
+    def _first_user_of(brain) -> str:
+        for item in brain.items:
+            if item.get("role") == "user":
+                content = item.get("content")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    return next((p.get("text", "") for p in content
+                                 if p.get("type") in ("text", "input_text")), "")
+        return ""

@@ -185,7 +185,7 @@ async def main() -> int:
     checks.append(("turned away", any(mv.direction in ("l", "r") and mv.ms == 500 for mv in escape),
                    str([(mv.direction, mv.ms) for mv in escape])))
     told = any("stuck" in msg.get("content", "")
-               for msgs in agent2.messages and [agent2.messages] for msg in msgs
+               for msgs in agent2.brain.items and [agent2.brain.items] for msg in msgs
                if msg.get("role") == "tool" and isinstance(msg.get("content"), str))
     checks.append(("model was told", told, "no 'stuck' in any tool reply"))
 
@@ -500,6 +500,93 @@ async def main() -> int:
                    reminder[:160]))
     checks.append(("the step reminder carries the last range",
                    "last range reading 60 cm" in reminder, reminder[:160]))
+
+    # --- the model that refuses reasoning with tools on chat completions ---
+    REFUSAL = ("Error code: 400 - Function tools with reasoning_effort are not supported "
+               "for gpt-6-luna in /v1/chat/completions. To use function tools, use "
+               "/v1/responses or set reasoning_effort to 'none'.")
+
+    class FakeResponses:
+        """A stand-in /v1/responses that answers with one tool call, then finish."""
+
+        def __init__(self):
+            self.calls = 0
+            self.seen = []
+
+        async def create(self, **kwargs):
+            self.seen.append(kwargs)
+            self.calls += 1
+            name, args = ("look", {"reason": "a"}) if self.calls == 1 else (
+                "finish", {"summary": "done with reasoning", "seen_now": True})
+            item = SimpleNamespace(
+                type="function_call", call_id=f"c{self.calls}", name=name,
+                arguments=json.dumps(args),
+                model_dump=lambda exclude_none=True, n=name, a=args, i=self.calls: {
+                    "type": "function_call", "call_id": f"c{i}", "name": n,
+                    "arguments": json.dumps(a)},
+            )
+            usage = SimpleNamespace(input_tokens=100, output_tokens=10,
+                                    input_tokens_details=SimpleNamespace(cached_tokens=40))
+            return SimpleNamespace(output=[item], usage=usage, status="completed")
+
+    class PickyModel(StubModel):
+        """Rejects reasoning on chat completions, the way gpt-6-luna does."""
+
+        def __init__(self):
+            super().__init__([])
+            self.responses = FakeResponses()
+
+        async def _create(self, **kwargs):
+            raise RuntimeError(REFUSAL)
+
+    events.clear()
+    tmp18 = Path(tempfile.mkdtemp())
+    picky = PickyModel()
+    agent18 = Agent(FakeRobot(Calibration()), Memory(tmp18), picky, "gpt-6-luna",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp18),
+                    reasoning_effort="medium")
+    m18 = await agent18.run("find the ball", max_steps=6)
+
+    checks.append(("with reasoning it goes straight to the responses API",
+                   picky.responses.calls > 0 and picky.seen == [],
+                   f"responses {picky.responses.calls}, chat {len(picky.seen)}"))
+    checks.append(("and the mission runs", m18.finished_summary == "done with reasoning",
+                   f"{m18.finished_summary} / {m18.error}"))
+
+    # forced onto chat completions, the refusal must move it across by itself
+    events.clear()
+    tmp19 = Path(tempfile.mkdtemp())
+    picky2 = PickyModel()
+    agent19 = Agent(FakeRobot(Calibration()), Memory(tmp19), picky2, "gpt-6-luna",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp19),
+                    reasoning_effort="medium")
+    agent19.api = "chat"
+    m19 = await agent19.run("find the ball", max_steps=6)
+    checks.append(("a refusal moves it to the responses API",
+                   any(k == "model" and "responses" in t for k, t in events),
+                   str([t for k, t in events if k == "model"])))
+    checks.append(("and it recovers the mission",
+                   m19.finished_summary == "done with reasoning",
+                   f"{m19.finished_summary} / {m19.error}"))
+    checks.append(("reasoning was actually asked for",
+                   picky.responses.seen and picky.responses.seen[0]["reasoning"] ==
+                   {"effort": "medium"}, str(picky.responses.seen[:1])[:120]))
+    checks.append(("tools went in the responses shape",
+                   picky.responses.seen and
+                   all(t.get("type") == "function" and "name" in t
+                       for t in picky.responses.seen[0]["tools"]),
+                   str(picky.responses.seen[0]["tools"][:1])[:120] if picky.responses.seen else ""))
+    checks.append(("token usage was counted", m18.tokens_in == 200 and m18.tokens_cached == 80,
+                   f"{m18.tokens_in}/{m18.tokens_cached}"))
+
+    # with no reasoning wanted, it stays on the cheaper chat API
+    from llm import ChatBrain, ResponsesBrain, make_brain
+    plain = make_brain(picky, "m", [{"name": "x", "description": "", "parameters": {}}], None)
+    thinking = make_brain(picky, "m", [{"name": "x", "description": "", "parameters": {}}], "low")
+    checks.append(("no reasoning: chat completions", isinstance(plain, ChatBrain),
+                   type(plain).__name__))
+    checks.append(("reasoning wanted: responses", isinstance(thinking, ResponsesBrain),
+                   type(thinking).__name__))
 
     failed = 0
     for name, ok, detail in checks:

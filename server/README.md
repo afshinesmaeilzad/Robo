@@ -239,9 +239,20 @@ small token cost, and enough to see a floor, a doorway or a chair leg. `high`
 costs several times more for detail this robot does not need.
 
 On a model that thinks before answering, `REASONING_EFFORT` (none | minimal |
-low | medium | high) trades thinking for speed and cost. `none` suits driving:
-the pictures do the work. A model that does not take the setting is detected and
-the setting dropped, rather than the mission failing.
+low | medium | high) trades speed for judgement. `medium` suits driving around
+furniture; `none` is cheapest and fastest.
+
+**Which API.** Some models refuse function tools and reasoning together on Chat
+Completions:
+
+> Function tools with reasoning_effort are not supported for gpt-6-luna in
+> /v1/chat/completions. To use function tools, use /v1/responses…
+
+So the server picks the API to match the run: **Responses** when reasoning is
+wanted (it also feeds the model's reasoning back between tool calls, so it keeps
+its train of thought), **Chat Completions** otherwise, which is simpler and
+cheaper. If a model refuses mid-mission it switches across by itself rather than
+failing, and if neither will think with tools it carries on without reasoning.
 
 The dashboard shows tokens in (and how many of those were cached), tokens out,
 seconds per step and an estimated price. **Set the prices in `.env` to match the
