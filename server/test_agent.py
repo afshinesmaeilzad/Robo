@@ -131,7 +131,7 @@ async def main() -> int:
     images = [m for m in last if isinstance(m.get("content"), list)
               and any(p.get("type") == "image_url" for p in m["content"])]
     dropped = [m for m in last if isinstance(m.get("content"), str)
-               and "picture dropped" in m["content"]]
+               and "picture no longer shown" in m["content"]]
     checks.append(("one image kept in context", len(images) == 1, str(len(images))))
     checks.append(("older image pruned", len(dropped) == 1, str(len(dropped))))
 
@@ -421,6 +421,49 @@ async def main() -> int:
     m14 = await agent14.run("explore", max_steps=8)
     checks.append(("a dead link ends the mission with a reason",
                    m14.error and "ReadError" in m14.error, str(m14.error)))
+
+    # --- the running plan comes back every step, and the old copy does not pile up ---
+    events.clear()
+    tmp15 = Path(tempfile.mkdtemp())
+    stub15 = StubModel([
+        ("Planning.", [tool_call("1", "set_plan", plan="sweep left, then the corridor")]),
+        ("Looking.", [tool_call("2", "look", reason="a")]),
+        ("New plan.", [tool_call("3", "set_plan", plan="corridor first")]),
+        ("Looking.", [tool_call("4", "look", reason="b")]),
+        ("Done.", [tool_call("5", "finish", summary="ok", seen_now=True)]),
+    ])
+    agent15 = Agent(FakeRobot(Calibration()), Memory(tmp15), stub15, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp15))
+    m15 = await agent15.run("find the ball", max_steps=8)
+
+    seen_second = stub15.seen[1]  # the request right after the plan was set
+    reminders = [m for m in seen_second if isinstance(m.get("content"), str)
+                 and "Your plan, as you last wrote it" in m["content"]]
+    checks.append(("the plan is shown back", len(reminders) == 1, str(len(reminders))))
+    checks.append(("the plan says what was planned",
+                   reminders and "sweep left" in reminders[0]["content"], str(reminders[:1])))
+
+    last_seen = stub15.seen[-1]
+    live = [m for m in last_seen if isinstance(m.get("content"), str)
+            and "Your plan, as you last wrote it" in m["content"]]
+    checks.append(("only the newest plan is kept", len(live) == 1, str(len(live))))
+    checks.append(("the plan was updated", live and "corridor first" in live[0]["content"],
+                   str(live[:1])))
+    checks.append(("the model never sees our private marker",
+                   all("_reminder" not in m for m in last_seen), "a _reminder key leaked"))
+    checks.append(("the plan is kept on the mission", m15.plan == "corridor first", m15.plan))
+
+    # --- the opening briefing picks notes that match the goal, not just the last ones ---
+    tmp16 = Path(tempfile.mkdtemp())
+    mem16 = Memory(tmp16)
+    mem16.add(Note(label="bear lamp corner", description="the bear night light sat here",
+                   x=10, y=10, heading=0))
+    for i in range(15):  # bury it under later, unrelated notes
+        mem16.add(Note(label=f"wall {i}", description="plain cabinet wall", x=i, y=0, heading=0))
+    brief = mem16.briefing("find the bear lamp")
+    checks.append(("an old but relevant note is surfaced", "bear night light sat here" in brief,
+                   brief[:120]))
+    checks.append(("recent notes are there too", "wall 14" in brief, brief[-120:]))
 
     failed = 0
     for name, ok, detail in checks:

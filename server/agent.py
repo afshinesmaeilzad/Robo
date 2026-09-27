@@ -67,6 +67,10 @@ How the robot moves:
   Try the same thing again, or take a picture; only give up if several attempts
   in a row fail.
 
+Keep a plan with set_plan(): what you are doing, what you have ruled out, where you
+are heading next. It is shown back to you every step and is the only thing that
+carries your thinking from one picture to the next, so keep it current.
+
 Be brief in your reasoning. Prefer acting to explaining."""
 
 EXPLORE_PROMPT = """
@@ -212,6 +216,23 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_plan",
+            "description": (
+                "Write down what you are doing and what comes next. It is shown back to "
+                "you every step, so use it to keep your bearings: what you are looking "
+                "for, where you have searched, which way you were heading. Update it "
+                "whenever the plan changes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"plan": {"type": "string"}},
+                "required": ["plan"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "recall",
             "description": "Search earlier notes.",
             "parameters": {
@@ -265,6 +286,7 @@ class Mission:
     images_sent: int = 0   # actually sent to the model
     images_skipped: int = 0  # unchanged views, sent as text instead
     stuck_events: int = 0    # moves that changed nothing, so an escape was driven
+    plan: str = ""           # the model's own running plan, shown back every step
     tokens_in: int = 0
     tokens_out: int = 0
     tokens_cached: int = 0  # part of tokens_in that was served from cache
@@ -398,6 +420,23 @@ class Agent:
             text += "\nThis place looks familiar:\n" + self.index.context(familiar)
         return text, base64.b64encode(jpeg).decode()
 
+    def _remind(self, mission: Mission) -> None:
+        """Put the running plan at the end of the conversation, not the system prompt.
+
+        Changing the system prompt each step would invalidate the cached prefix and
+        cost ten times as much; the tail is cheap to change.
+        """
+        self.messages[:] = [m for m in self.messages if not m.get("_reminder")]
+        if not mission.plan:
+            return
+        self.messages.append({
+            "role": "user",
+            "content": (f"Your plan, as you last wrote it: {mission.plan}\n"
+                        f"You are at {self.robot.pose.as_text()}, "
+                        f"step {mission.steps} of {mission.max_steps}."),
+            "_reminder": True,
+        })
+
     def _prune_images(self) -> None:
         """Keep only the newest images; older ones become a line of text."""
         seen = 0
@@ -409,7 +448,8 @@ class Agent:
             seen += 1
             if seen > self.keep_images:
                 text = next((p["text"] for p in msg["content"] if p.get("type") == "text"), "")
-                msg["content"] = f"{text} (picture dropped to save tokens)"
+                # Keep the place and your own description of it: only the pixels go
+                msg["content"] = f"{text} - picture no longer shown; your notes on it stand."
 
     async def _escape(self) -> str:
         """Back out of whatever the robot is caught on and turn away from it."""
@@ -507,6 +547,12 @@ class Agent:
             self.log("memory", note.as_text())
             return f"Remembered: {note.as_text()}", None
 
+        if name == "set_plan":
+            if self.mission:
+                self.mission.plan = args["plan"]
+            self.log("plan", args["plan"][:200])
+            return "Plan noted; it will be shown to you each step.", None
+
         if name == "recall":
             hits = self.memory.search(args["query"])
             self.log("recall", f"{args['query']} -> {len(hits)} note(s)")
@@ -558,7 +604,8 @@ class Agent:
         """One model call, retried briefly. Drops reasoning_effort if unsupported."""
         kwargs = dict(
             model=self.model,
-            messages=self.messages,
+            messages=[{k: v for k, v in m.items() if not k.startswith("_")}
+                      for m in self.messages],
             tools=TOOLS,
             parallel_tool_calls=False,
         )
@@ -610,7 +657,7 @@ class Agent:
                     f"Starting position: {self.robot.pose.as_text()}\n"
                     f"Notes from earlier runs (they may be out of date; the room and the "
                     f"things in it can have been moved since):\n"
-                    f"{self.memory.summary(with_age=True)}\n\n"
+                    f"{self.memory.briefing(goal)}\n\n"
                     + ("Those notes are hints about where to look. Trust only what you "
                        "see in the pictures you take now.\n\n" if mode == "target" else "")
                     + "Start by looking around."
@@ -636,6 +683,7 @@ class Agent:
                         ),
                     })
                 self._prune_images()
+                self._remind(mission)
                 try:
                     response = await self._ask()
                 except Exception as exc:  # noqa: BLE001 - usually a dropped packet

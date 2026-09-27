@@ -90,3 +90,19 @@ class Memory:
         if not self.notes:
             return "Nothing remembered yet."
         return "\n".join(n.as_text(with_age) for n in self.notes[-limit:])
+
+    def briefing(self, goal: str, recent: int = 10, relevant: int = 10) -> str:
+        """What to hand a mission at the start: what matters for THIS goal, plus
+        what happened most recently. With a hundred notes, the last twenty are
+        rarely the right twenty."""
+        if not self.notes:
+            return "Nothing remembered yet."
+        latest = self.notes[-recent:]
+        hits = [n for n in self.search(goal, limit=relevant) if n not in latest]
+        lines = []
+        if hits:
+            lines.append("Notes that look relevant to this goal:")
+            lines += [f"- {n.as_text(with_age=True)}" for n in hits]
+        lines.append("Most recent notes:")
+        lines += [f"- {n.as_text(with_age=True)}" for n in latest]
+        return "\n".join(lines)

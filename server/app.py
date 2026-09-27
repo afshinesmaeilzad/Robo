@@ -63,6 +63,7 @@ agent = Agent(
     model=MODEL,
     on_event=lambda kind, text: events.append({"t": time.time(), "kind": kind, "text": text}),
     picture_size=PICTURE_SIZE,
+    keep_images=int(os.getenv("KEEP_IMAGES", "6")),
     index=index,
     image_detail=IMAGE_DETAIL,
     reasoning_effort=REASONING,

@@ -142,6 +142,25 @@ Short nudges under 300 ms are exempt: they may genuinely change nothing.
 
 The dashboard counts these as **stuck Nx**.
 
+## Memory, short and long
+
+**Within a mission.** The last `KEEP_IMAGES` pictures (6 by default) stay in the
+conversation. Older ones lose their pixels but keep their text, so the model
+still knows a picture was taken there and what it said about it — dropping them
+entirely was throwing away the thread of its own reasoning.
+
+It also keeps a **plan** with `set_plan()`: what it is doing, what it has ruled
+out, where it is heading. The plan is shown back at the end of the conversation
+every step, so it survives pictures being pruned. It rides at the tail rather
+than in the system prompt, because changing the prompt would invalidate the
+cached prefix and cost ten times as much per step.
+
+**Between missions.** Notes and the picture index are on disk and loaded at
+startup. A mission opens with a briefing that mixes **notes matching this goal**
+with **the most recent notes** — with a hundred notes stored, the last twenty are
+rarely the right twenty. Everything carries its age and a warning that the room
+may have changed.
+
 ## How the agent works
 
 The model is given these tools:
