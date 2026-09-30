@@ -68,7 +68,12 @@ const int ECHO_PIN = 2;
 // second otherwise just to keep /info honest.
 const uint32_t PING_EVERY_MS = 100;
 const uint32_t PING_IDLE_MS = 1000;
-const int STOP_CM = 20;   // do not drive forward closer than this
+// How close the robot may drive before it refuses to go forward. Normally 20 cm;
+// the server lowers it briefly (/set?stopcm=) when it means to touch something,
+// such as nudging a toy it was asked to push.
+volatile int stopCm = 20;
+const int STOP_CM_MIN = 4;
+const int STOP_CM_MAX = 80;
 const int CLOSE_CM = 45;  // "something is coming up" for the driver
 const uint32_t PING_TIMEOUT_US = 25000;  // ~4 m, the sensor's limit
 
@@ -404,7 +409,7 @@ void updateDistance() {
   int cm = measureDistance();
   distanceCm = cm;
   if (cm > 0) sonarSeen = true;
-  bool tooClose = (cm > 0 && cm < STOP_CM);
+  bool tooClose = (cm > 0 && cm < stopCm);
   blockedAhead = tooClose;
   if (tooClose && targetLeft > 0 && targetRight > 0) {
     drive(0, 0);  // stop now; the camera would not have seen this
@@ -677,6 +682,8 @@ static esp_err_t setHandler(httpd_req_t *req) {
     else if (!strcmp(v, "off")) flashMode = 2;
   }
   if (queryParam(req, "fps", v, sizeof(v)))   streamFps = constrain(atoi(v), 1, 25);
+  if (queryParam(req, "stopcm", v, sizeof(v)))
+    stopCm = constrain(atoi(v), STOP_CM_MIN, STOP_CM_MAX);
   if (queryParam(req, "size", v, sizeof(v))) {
     // Applied at the next picture, while the camera is awake
     if (!strcmp(v, "qqvga")) wantSize = FRAMESIZE_QQVGA;
@@ -714,13 +721,13 @@ static esp_err_t infoHandler(httpd_req_t *req) {
            "{\"up\":%lu,\"boots\":%lu,\"reset\":\"%s\",\"ch\":%d,\"rssi\":%d,\"clients\":%d,\"heap\":%lu,"
            "\"home\":%d,\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,"
            "\"picms\":%lu,\"flash\":%d,\"usedflash\":%d,\"bright\":%d,"
-           "\"dist\":%d,\"blocked\":%d,\"sonar\":%d,\"sonarpaused\":%d}",
+           "\"dist\":%d,\"blocked\":%d,\"sonar\":%d,\"sonarpaused\":%d,\"stopcm\":%d}",
            (unsigned long)(millis() / 1000), (unsigned long)bootCount, resetReason(), apChannel,
            rssi, WiFi.softAPgetStationNum(), (unsigned long)ESP.getMinFreeHeap(),
            joinedHome ? 1 : 0, camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
            (unsigned long)lastPicBytes, (unsigned long)lastPicMs,
            flashMode, lastUsedFlash ? 1 : 0, lastBrightness,
-           distanceCm, blockedAhead ? 1 : 0, sonarSeen ? 1 : 0, flashOn ? 1 : 0);
+           distanceCm, blockedAhead ? 1 : 0, sonarSeen ? 1 : 0, flashOn ? 1 : 0, stopCm);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_sendstr(req, out);

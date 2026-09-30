@@ -213,6 +213,10 @@ class Robot:
         except RobotError as exc:
             raise RobotError(f"could not change {list(params)[0]}: {exc}") from exc
 
+    async def set_stop_distance(self, cm: int) -> None:
+        """How close the robot may drive before it refuses to go forward."""
+        await self._set(stopcm=max(4, min(int(cm), 80)))
+
     async def set_speed(self, speed: int) -> None:
         wanted = max(80, min(int(speed), 255))
         await self._set(speed=wanted)

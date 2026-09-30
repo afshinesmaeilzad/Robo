@@ -36,6 +36,9 @@ MIN_TRAVEL_CM = 150
 # it has usually just believed an old note.
 MIN_TARGET_LOOKS = 6
 STALL_SPEED = 230  # tired batteries will not turn the wheels much below this
+NUDGE_SPEED = 150     # a push, at walking pace
+NUDGE_STOP_CM = 5     # how close the robot may get while deliberately touching
+NORMAL_STOP_CM = 20   # ...and what it goes back to afterwards
 MAX_HICCUPS = 3  # consecutive failed steps before a mission gives up
 DITHER_STEPS = 6      # look back this many steps...
 DITHER_CM = 40        # ...and if it has got this far or less, say so
@@ -130,12 +133,15 @@ This mission is FINDING AND APPROACHING A TARGET.
   get nearer.
 - Close in slowly. Stop while it is still a little ahead: the camera cannot see
   the ground right in front of the wheels.
-- Do not chase a person or a pet that is moving away, and do not drive at
-  anything breakable. If the target moves, wait and look again rather than
-  charging after it.
-- A person or a pet in view is an obstacle to go round, like a chair: keep about
-  half a metre away and steer past. Do not keep reversing away from them, and do
-  not abandon the room because someone is standing in it.
+- Never drive into a person or an animal, and never into anything that could
+  break, spill or fall on the robot: glass, screens, drinks, candles, cables,
+  tall or stacked things. Keep half a metre from people and pets and steer past
+  them; they are obstacles to go round, not reasons to leave the room.
+- Everyday objects on the floor are different. If the goal asks you to reach,
+  touch, push, nudge or "attack" a sturdy small object - a toy, a ball, a shoe,
+  an empty box - you may make gentle contact with nudge() once you can see it
+  close ahead. It is a small robot at walking pace; a push is a push, not damage.
+  Do not use it on anything in the list above, and never on a living thing.
 - Notes from earlier runs are HINTS ABOUT WHERE TO LOOK, never proof. Things get
   moved, including by the person who set you this task. A note saying the target
   was found before does not mean it is there now.
@@ -229,6 +235,25 @@ TOOLS = [
         },
     },
     {
+        "name": "nudge",
+        "description": (
+            "Drive gently into the object straight ahead to touch or push it. Only "
+            "for sturdy everyday things the goal told you to reach, touch, push or "
+            "attack, and only when you can see the object close ahead. Never on a "
+            "person, an animal, or anything that could break, spill or topple."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "what": {"type": "string",
+                         "description": "What you are nudging, as you see it right now."},
+                "ms": {"type": "integer", "minimum": 150, "maximum": 900,
+                       "description": "How long to push for. 300-500 is a nudge."},
+            },
+            "required": ["what"],
+        },
+    },
+    {
         "name": "set_speed",
         "description": (
             "Motor power, 80 (crawl) to 255 (fast). Slow down to close in on "
@@ -285,6 +310,15 @@ TOOLS = [
 ]
 
 
+CONTACT_WORDS = ("attack", "push", "nudge", "bump", "touch", "hit", "knock",
+                 "kick", "shove", "poke", "ram")
+
+
+def contact_wanted(goal: str) -> bool:
+    """Did the goal ask for the target to be touched, rather than just found?"""
+    return any(w in goal.lower() for w in CONTACT_WORDS)
+
+
 def mode_for(goal: str) -> str:
     """Guess the kind of mission from how it is worded."""
     words = goal.lower()
@@ -306,6 +340,7 @@ class Mission:
     images_skipped: int = 0  # unchanged views, sent as text instead
     stuck_events: int = 0    # moves that changed nothing, so an escape was driven
     plan: str = ""           # the model's own running plan, shown back every step
+    contact_ok: bool = False  # the goal asked for the target to be touched or pushed
     tokens_in: int = 0
     tokens_out: int = 0
     tokens_cached: int = 0  # part of tokens_in that was served from cache
@@ -578,6 +613,28 @@ class Agent:
             text, b64 = await self._take_picture()
             return text + await self._sonar_note(), b64
 
+        if name == "nudge":
+            if not (self.mission and self.mission.contact_ok):
+                return ("This mission did not ask for anything to be touched, so I have "
+                        "not. Say what should be pushed in the goal if you want that."), None
+            ms = int(args.get("ms", 400))
+            was_speed = self.robot.cal.speed
+            self.log("nudge", f"{args.get('what', 'something')} for {ms}ms")
+            try:
+                # the range finder normally refuses forward inside 20 cm: that is
+                # exactly the distance a nudge happens at
+                await self.robot.set_stop_distance(NUDGE_STOP_CM)
+                await self.robot.set_speed(NUDGE_SPEED)
+                await self.robot.move("f", min(max(ms, 150), 900))
+            finally:
+                await self.robot.set_stop_distance(NORMAL_STOP_CM)
+                try:
+                    await self.robot.set_speed(was_speed)
+                except RobotError:
+                    pass
+            text, b64 = await self._take_picture()
+            return (f"Nudged {args.get('what', 'it')} at low speed. {text}"), b64
+
         if name == "set_speed":
             await self.robot.set_speed(args["speed"])
             self.log("speed", f"motors set to {self.robot.cal.speed}")
@@ -686,7 +743,8 @@ class Agent:
     async def run(self, goal: str, max_steps: int, mode: str = "auto") -> Mission:
         if mode not in ("explore", "target"):
             mode = mode_for(goal)
-        mission = Mission(goal=goal, mode=mode, max_steps=max_steps, running=True)
+        mission = Mission(goal=goal, mode=mode, max_steps=max_steps, running=True,
+                          contact_ok=contact_wanted(goal))
         self.mission = mission
         self.finish_questioned = False
         self.start_distance = self.robot.pose.distance
@@ -706,6 +764,10 @@ class Agent:
             f"{self.memory.briefing(goal)}\n\n"
             + ("Those notes are hints about where to look. Trust only what you "
                "see in the pictures you take now.\n\n" if mode == "target" else "")
+            + ("This goal asks you to touch or push the target. If it is a sturdy "
+               "everyday object - not a person, an animal, or anything breakable - "
+               "use nudge() when you can see it close ahead.\n\n"
+               if contact_wanted(goal) else "")
             + "Start by looking around.",
         )
         self.log("start", f"[{mode}] {goal}")

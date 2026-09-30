@@ -635,6 +635,61 @@ async def main() -> int:
                    any(k == "speed" and "230" in t for k, t in events),
                    str([t for k, t in events if k == "speed"])))
 
+    # --- nudging: allowed when the goal asks for it, refused when it does not ---
+    from agent import contact_wanted, NUDGE_STOP_CM, NORMAL_STOP_CM
+
+    wants = {"go and attack this toy": True, "push the ball": True,
+             "find the bear lamp": False, "explore the room": False}
+    checks.append(("a goal that asks for contact is recognised",
+                   all(contact_wanted(g) == w for g, w in wants.items()),
+                   str({g: contact_wanted(g) for g in wants})))
+
+    class NudgeRobot(FakeRobot):
+        def __init__(self):
+            super().__init__(Calibration())
+            self.stop_cm = []
+            self.speeds = []
+
+        async def set_stop_distance(self, cm):
+            self.stop_cm.append(cm)
+
+        async def set_speed(self, speed):
+            self.speeds.append(speed)
+            await super().set_speed(speed)
+
+    events.clear()
+    tmp23 = Path(tempfile.mkdtemp())
+    robot23 = NudgeRobot()
+    stub23 = StubModel([("Push it.", [tool_call("1", "nudge", what="the toy", ms=400)]),
+                        ("Done.", [tool_call("2", "finish", summary="pushed", seen_now=True)])])
+    agent23 = Agent(robot23, Memory(tmp23), stub23, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp23))
+    m23 = await agent23.run("go and attack this toy", max_steps=5)
+    checks.append(("the mission allows contact", m23.contact_ok, str(m23.contact_ok)))
+    checks.append(("it nudged", any(k == "nudge" for k, t in events),
+                   str([k for k, _ in events])))
+    checks.append(("the stop distance was lowered then restored",
+                   robot23.stop_cm == [NUDGE_STOP_CM, NORMAL_STOP_CM], str(robot23.stop_cm)))
+    checks.append(("and it pushed gently", 150 in robot23.speeds, str(robot23.speeds)))
+    forward = [mv for mv in robot23.moves if mv.direction == "f"]
+    checks.append(("the push was a short forward move",
+                   len(forward) == 1 and forward[0].ms == 400,
+                   str([(m.direction, m.ms) for m in robot23.moves])))
+
+    # a mission that never asked for contact must refuse
+    events.clear()
+    tmp24 = Path(tempfile.mkdtemp())
+    robot24 = NudgeRobot()
+    stub24 = StubModel([("Push it.", [tool_call("1", "nudge", what="the toy")]),
+                        ("Fine.", [tool_call("2", "finish", summary="looked", seen_now=True)])])
+    agent24 = Agent(robot24, Memory(tmp24), stub24, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp24))
+    m24 = await agent24.run("find the bear lamp", max_steps=5)
+    checks.append(("a look-only mission refuses to nudge",
+                   not m24.contact_ok and robot24.stop_cm == [] and
+                   not any(mv.direction == "f" for mv in robot24.moves),
+                   f"contact_ok={m24.contact_ok}, stops={robot24.stop_cm}"))
+
     failed = 0
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"  (got {detail})"))
