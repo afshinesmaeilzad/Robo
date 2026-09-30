@@ -503,13 +503,22 @@ class Agent:
             return
         self.last_nudge_step = mission.steps
         self.log("dithering", f"{moved:.0f}cm in {DITHER_STEPS} steps")
-        self.brain.add_user_text(
-            f"You have moved {moved:.0f} cm in the last {DITHER_STEPS} steps: you are "
-            "turning and reversing in one spot, not exploring. Pick the most open "
-            "direction you can see and commit to it with follow_path - several steps "
-            "of 1000-1500 ms at speed 200 or more. If every direction really is "
-            "blocked, say so and finish."
-        )
+        if mission.mode == "target":
+            self.brain.add_user_text(
+                f"You have moved {moved:.0f} cm in the last {DITHER_STEPS} steps, mostly "
+                "turning. If you can see the target, stop aiming and drive at it: a few "
+                "short forward steps, correcting between them, gets there faster than "
+                "another turn. If you cannot see it, leave this spot and search "
+                "somewhere else."
+            )
+        else:
+            self.brain.add_user_text(
+                f"You have moved {moved:.0f} cm in the last {DITHER_STEPS} steps: you are "
+                "turning and reversing in one spot, not exploring. Pick the most open "
+                "direction you can see and commit to it with follow_path - several steps "
+                "of 1000-1500 ms at speed 200 or more. If every direction really is "
+                "blocked, say so and finish."
+            )
 
     def _remind(self, mission: Mission) -> None:
         """Put the running plan, position, speed and range at the end of the talk.

@@ -25,7 +25,7 @@ from agent import Agent, mode_for
 from discover import find_robot
 from memory import Memory
 from robot import Calibration, FakeRobot, Robot, RobotError
-from vision_index import VisionIndex
+from vision_index import VisionIndex, fingerprint, similarity
 
 load_dotenv()
 
@@ -178,6 +178,47 @@ async def calibrate(ms: int = 1000, runs: int = 3):
                  "rough - run it again facing a flat wall",
         "put_in_env": f"CM_PER_SEC={full:.0f}",
     }
+
+
+@app.post("/api/calibrate_turn")
+async def calibrate_turn(step_ms: int = 400, max_steps: int = 40):
+    """Measure how fast the robot really turns, by spinning until the view returns.
+
+    A full turn brings the camera back to where it started, and the picture index
+    already knows how to tell one view from another. Needs room to spin and a
+    scene with some detail in it - a blank wall all round will not do.
+    """
+    if agent.mission and agent.mission.running:
+        raise HTTPException(409, "A mission is running; stop it first.")
+    first = await robot.picture(PICTURE_SIZE)
+    ref = fingerprint(first)
+    scores, elapsed = [], 0.0
+    left_home = False
+    for _ in range(max_steps):
+        await robot.move("r", step_ms)
+        elapsed += step_ms / 1000
+        await asyncio.sleep(0.25)
+        score = similarity(*ref, *fingerprint(await robot.picture(PICTURE_SIZE)))
+        scores.append(round(score, 3))
+        if score < 0.75:
+            left_home = True          # we are looking at something else now
+        elif left_home and score > 0.88:
+            deg_per_sec = 360 / elapsed
+            full = deg_per_sec * 255 / robot.cal.speed
+            robot.cal.deg_per_sec = full
+            return {
+                "turned_full_circle_in": round(elapsed, 1),
+                "deg_per_sec_at_speed": round(deg_per_sec),
+                "speed": robot.cal.speed,
+                "deg_per_sec_full_power": round(full),
+                "scores": scores,
+                "put_in_env": f"DEG_PER_SEC={full:.0f}",
+            }
+    raise HTTPException(
+        400,
+        "Never came back to the starting view. Give it room to spin, point it at "
+        f"something with detail, and try again. Similarities seen: {scores}",
+    )
 
 
 @app.get("/api/state")
@@ -350,6 +391,7 @@ button{cursor:pointer}button.go{background:#2a7}button.stop{background:#a33}
     <button onclick="refresh(true)">📷 picture</button>
     <button onclick="post('/api/find')">🔎 find robot</button>
     <button onclick="calibrate()" title="Point at a wall 60-200cm away, then press">📐 measure speed</button>
+    <button onclick="calibrateTurn()" title="Needs room to spin">🔄 measure turn</button>
   </div>
   <canvas id="map" height="320"></canvas>
 </div>
@@ -370,6 +412,13 @@ async function calibrate(){
   const d = await r.json();
   alert(r.ok ? `Measured ${d.cm_per_sec_at_speed} cm/s at speed ${d.speed}.\n` +
                `Put this in server/.env:  ${d.put_in_env}` : (d.detail || 'failed'));
+}
+async function calibrateTurn(){
+  const r = await fetch('/api/calibrate_turn', {method: 'POST'});
+  const d = await r.json();
+  alert(r.ok ? `A full turn took ${d.turned_full_circle_in}s at speed ${d.speed}` +
+               ` (${d.deg_per_sec_at_speed} deg/s).\nPut this in server/.env:  ${d.put_in_env}`
+             : (d.detail || 'failed'));
 }
 const start = () => post('/api/start', {goal: $('goal').value, mode: $('mode').value,
                                          max_steps: +$('steps').value});

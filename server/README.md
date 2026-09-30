@@ -246,8 +246,15 @@ be wildly wrong, and it waits out a full ping between readings — standing stil
 the robot only pings once a second, so an immediate answer can describe where it
 was a moment ago.
 
-The turn rate still has to be measured by hand: spin for two seconds and estimate
-the degrees.
+**🔄 measure turn** (or `POST /api/calibrate_turn`) does the same for turning: the
+robot spins in small steps until the camera sees its starting view again, which
+is one full circle, and works out degrees per second from the time it took.
+
+Both matter more than they sound. Measured on this robot, a full turn takes 10.4
+seconds at speed 200 - 35 degrees per second, where the default guessed 180. The
+model asking for an 804 ms turn was expecting 113 degrees and getting 28, then
+"correcting" the overshoot that never happened. Every aiming attempt was fighting
+a number I made up.
 
 The estimate drifts, especially on carpet. It is a hint for the model, not a map.
 
