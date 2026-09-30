@@ -716,7 +716,7 @@ static esp_err_t infoHandler(httpd_req_t *req) {
     wifi_sta_list_t sta;
     if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) rssi = sta.sta[0].rssi;
   }
-  char out[256];
+  char out[420];  // grows every time a field is added; truncation is silent
   snprintf(out, sizeof(out),
            "{\"up\":%lu,\"boots\":%lu,\"reset\":\"%s\",\"ch\":%d,\"rssi\":%d,\"clients\":%d,\"heap\":%lu,"
            "\"home\":%d,\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,"
