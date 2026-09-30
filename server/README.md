@@ -165,6 +165,29 @@ with **the most recent notes** — with a hundred notes stored, the last twenty 
 rarely the right twenty. Everything carries its age and a warning that the room
 may have changed.
 
+## Touching things
+
+Asked to "attack the toy bear", the model used to refuse: my prompt said never
+drive at anything that could be hurt, which reads as never touch anything.
+
+The line is now where it belongs. **Never** a person, an animal, or anything that
+could break, spill or topple — glass, screens, drinks, candles, cables, stacked
+things. **Allowed**, when the goal asks for it, a sturdy object on the floor: a
+toy, a ball, a shoe, an empty box.
+
+`nudge()` drives into it deliberately: 150 speed for a tap, 230 and up to 1.5 s
+for a shove. The range finder normally refuses to go forward inside 20 cm, which
+is exactly where contact happens, so the nudge lowers that limit to 5 cm and puts
+it back afterwards.
+
+It only exists when the goal asked for it — attack, push, bump, touch, knock,
+kick, shove, throw, topple — and a mission that only asked to *find* something
+refuses and says why.
+
+**The robot has no arm**, so it cannot pick anything up or throw it. Asked to
+throw something, it gives it a firm shove and says plainly that it pushed rather
+than threw. That is the honest version of the request, not a refusal.
+
 ## How the agent works
 
 The model is given these tools:
@@ -174,6 +197,7 @@ The model is given these tools:
 | `look(reason)` | takes a picture and shows it to the model |
 | `move(direction, ms, speed)` | one move, then stop — for small corrections |
 | `set_speed(speed)` | motor power 80–255: crawl past furniture, hurry across open floor |
+| `nudge(what, ms, firm)` | drive gently into a sturdy object the goal named — a tap, or a firm shove |
 | `set_plan(plan)` | what it is doing and what comes next, shown back every step |
 | `follow_path(steps, purpose, speed)` | up to 6 moves in a row, then **one** picture |
 | `remember(label, description, tags)` | saves a note with the current position |

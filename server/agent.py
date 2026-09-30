@@ -36,7 +36,8 @@ MIN_TRAVEL_CM = 150
 # it has usually just believed an old note.
 MIN_TARGET_LOOKS = 6
 STALL_SPEED = 230  # tired batteries will not turn the wheels much below this
-NUDGE_SPEED = 150     # a push, at walking pace
+NUDGE_SPEED = 150     # a tap, at walking pace
+SHOVE_SPEED = 230     # a firm push, for "knock it over" and "throw it"
 NUDGE_STOP_CM = 5     # how close the robot may get while deliberately touching
 NORMAL_STOP_CM = 20   # ...and what it goes back to afterwards
 MAX_HICCUPS = 3  # consecutive failed steps before a mission gives up
@@ -139,9 +140,14 @@ This mission is FINDING AND APPROACHING A TARGET.
   them; they are obstacles to go round, not reasons to leave the room.
 - Everyday objects on the floor are different. If the goal asks you to reach,
   touch, push, nudge or "attack" a sturdy small object - a toy, a ball, a shoe,
-  an empty box - you may make gentle contact with nudge() once you can see it
-  close ahead. It is a small robot at walking pace; a push is a push, not damage.
+  an empty box - you may make contact with nudge() once you can see it close
+  ahead. It is a small robot at walking pace; a push is a push, not damage.
   Do not use it on anything in the list above, and never on a living thing.
+- You have no arm and no gripper: you cannot pick anything up, throw it, or carry
+  it. What you can do is drive into it. So if the goal says throw, hurl, knock
+  over or send it flying, the nearest thing you can do is a firm shove -
+  nudge(firm=true, ms=800-1500) with clear floor beyond it - and then say plainly
+  that you pushed it rather than threw it, and how far it went.
 - Notes from earlier runs are HINTS ABOUT WHERE TO LOOK, never proof. Things get
   moved, including by the person who set you this task. A note saying the target
   was found before does not mean it is there now.
@@ -247,8 +253,13 @@ TOOLS = [
             "properties": {
                 "what": {"type": "string",
                          "description": "What you are nudging, as you see it right now."},
-                "ms": {"type": "integer", "minimum": 150, "maximum": 900,
-                       "description": "How long to push for. 300-500 is a nudge."},
+                "ms": {"type": "integer", "minimum": 150, "maximum": 1500,
+                       "description": "How long to push for. 300-500 taps it; 800-1500 "
+                                      "shoves it across the floor."},
+                "firm": {"type": "boolean",
+                         "description": "Push hard (more motor power). Use when asked to "
+                                        "knock, shove or throw something, on sturdy objects "
+                                        "only."},
             },
             "required": ["what"],
         },
@@ -311,7 +322,7 @@ TOOLS = [
 
 
 CONTACT_WORDS = ("attack", "push", "nudge", "bump", "touch", "hit", "knock",
-                 "kick", "shove", "poke", "ram")
+                 "kick", "shove", "poke", "ram", "throw", "hurl", "topple")
 
 
 def contact_wanted(goal: str) -> bool:
@@ -627,14 +638,16 @@ class Agent:
                 return ("This mission did not ask for anything to be touched, so I have "
                         "not. Say what should be pushed in the goal if you want that."), None
             ms = int(args.get("ms", 400))
+            firm = bool(args.get("firm"))
             was_speed = self.robot.cal.speed
-            self.log("nudge", f"{args.get('what', 'something')} for {ms}ms")
+            self.log("nudge", f"{'shoved' if firm else 'nudged'} "
+                              f"{args.get('what', 'something')} for {ms}ms")
             try:
                 # the range finder normally refuses forward inside 20 cm: that is
                 # exactly the distance a nudge happens at
                 await self.robot.set_stop_distance(NUDGE_STOP_CM)
-                await self.robot.set_speed(NUDGE_SPEED)
-                await self.robot.move("f", min(max(ms, 150), 900))
+                await self.robot.set_speed(SHOVE_SPEED if firm else NUDGE_SPEED)
+                await self.robot.move("f", min(max(ms, 150), 1500))
             finally:
                 await self.robot.set_stop_distance(NORMAL_STOP_CM)
                 try:
@@ -642,7 +655,8 @@ class Agent:
                 except RobotError:
                     pass
             text, b64 = await self._take_picture()
-            return (f"Nudged {args.get('what', 'it')} at low speed. {text}"), b64
+            how = "Shoved" if firm else "Nudged"
+            return (f"{how} {args.get('what', 'it')} for {ms} ms. {text}"), b64
 
         if name == "set_speed":
             await self.robot.set_speed(args["speed"])

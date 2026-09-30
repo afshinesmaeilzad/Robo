@@ -671,6 +671,23 @@ async def main() -> int:
     checks.append(("the stop distance was lowered then restored",
                    robot23.stop_cm == [NUDGE_STOP_CM, NORMAL_STOP_CM], str(robot23.stop_cm)))
     checks.append(("and it pushed gently", 150 in robot23.speeds, str(robot23.speeds)))
+
+    # a firm shove, for "throw it": harder and longer, still through nudge()
+    events.clear()
+    tmp25 = Path(tempfile.mkdtemp())
+    robot25 = NudgeRobot()
+    stub25 = StubModel([("Shove it.", [tool_call("1", "nudge", what="the toy", ms=1200,
+                                                 firm=True)]),
+                        ("Done.", [tool_call("2", "finish", summary="shoved", seen_now=True)])])
+    agent25 = Agent(robot25, Memory(tmp25), stub25, "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp25))
+    await agent25.run("attack the bear and throw it", max_steps=5)
+    shove = [mv for mv in robot25.moves if mv.direction == "f"]
+    checks.append(("a firm shove is harder", 230 in robot25.speeds, str(robot25.speeds)))
+    checks.append(("and longer", shove and shove[0].ms == 1200,
+                   str([(m.direction, m.ms) for m in robot25.moves])))
+    checks.append(("logged as a shove", any(k == "nudge" and "shoved" in t for k, t in events),
+                   str([t for k, t in events if k == "nudge"])))
     forward = [mv for mv in robot23.moves if mv.direction == "f"]
     checks.append(("the push was a short forward move",
                    len(forward) == 1 and forward[0].ms == 400,
