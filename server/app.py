@@ -260,8 +260,39 @@ async def find():
     return {"found": host}
 
 
+async def watchdog() -> None:
+    """Keep the robot findable without anyone restarting anything.
+
+    A robot that is switched off, runs flat, or comes back on a different address
+    used to mean a dead server until someone noticed. Now the failures are
+    counted, the connections are rebuilt, and the network is searched again.
+    """
+    while True:
+        await asyncio.sleep(20)
+        if isinstance(robot, FakeRobot):
+            continue
+        if agent.mission and agent.mission.running:
+            continue  # a mission does its own retrying; do not fight it
+        if robot.failures < 2:
+            continue
+        events.append({"t": time.time(), "kind": "find",
+                       "text": f"{robot.failures} failed requests: looking for the robot"})
+        await robot._fresh_http()
+        found = await find_robot(robot.host)
+        if found:
+            moved = found != robot.host
+            globals()["ROBOT_HOST"] = robot.host = found
+            robot.failures = 0
+            events.append({"t": time.time(), "kind": "find",
+                           "text": f"robot at {found}" + (" (it had moved)" if moved else "")})
+        else:
+            events.append({"t": time.time(), "kind": "find",
+                           "text": "still cannot find the robot; is it powered on?"})
+
+
 @app.on_event("startup")
 async def startup():
+    asyncio.create_task(watchdog())
     """With ROBOT_HOST=auto, go looking for the robot before the first mission."""
     global ROBOT_HOST
     if ROBOT_HOST != "auto":

@@ -15,6 +15,7 @@
 #include "esp_http_server.h"
 #include "esp_wifi.h"
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include "esp_attr.h"
 #include "lwip/sockets.h"
 #include "soc/soc.h"
@@ -34,7 +35,10 @@ const uint32_t JOIN_TIMEOUT_MS = 15000;
 // After falling back to our own network, try the home network again this often.
 // A phone hotspot comes and goes (and drops to 5 GHz, which this chip cannot
 // see), so the robot should rejoin by itself rather than need a reset.
-const uint32_t REJOIN_EVERY_MS = 60000;
+const uint32_t REJOIN_EVERY_MS = 20000;
+// If the home network goes away under us (the hotspot restarts, or drops to
+// 5 GHz), try quietly for this long before giving up and making our own again.
+const uint32_t RECONNECT_PATIENCE_MS = 45000;
 
 // Full transmit power: a solid link matters more than battery life. Lower
 // values (8.5 and 13 dBm) were tried to save current and made the link slow
@@ -135,6 +139,7 @@ RTC_NOINIT_ATTR uint32_t bootMagic;
 RTC_NOINIT_ATTR uint32_t bootCount;
 int apChannel = 1;
 bool joinedHome = false;
+volatile bool otaRunning = false;      // pause everything else while flashing
 volatile bool lastUsedFlash = false;
 volatile int lastBrightness = -1;
 const char *MDNS_NAME = "robo";  // http://robo.local
@@ -830,6 +835,7 @@ void startWiFi() {
       Serial.printf("Joined \"%s\" on channel %d  ->  http://%s  (or http://%s.local)\n",
                     HOME_SSID, apChannel, WiFi.localIP().toString().c_str(), MDNS_NAME);
       if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+      startOTA();
       return;
     }
     switch (WiFi.status()) {
@@ -851,6 +857,7 @@ void startWiFi() {
   Serial.printf("WiFi AP \"%s\" / \"%s\" on channel %d  ->  http://%s\n", AP_SSID, AP_PASS, apChannel,
                 WiFi.softAPIP().toString().c_str());
   if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+  startOTA();
 }
 
 // While running on our own network with nobody connected, keep an eye out for
@@ -873,6 +880,52 @@ void retryHomeWiFi() {
   WiFi.softAPdisconnect(true);
   startWiFi();
   startServer();
+}
+
+// Flashing over WiFi: the board lives on the robot, and taking it off to plug
+// in USB is how a five-minute change becomes a twenty-minute one.
+void startOTA() {
+  ArduinoOTA.setHostname(MDNS_NAME);
+  ArduinoOTA.onStart([]() {
+    drive(0, 0);                       // wheels off before anything else
+    setMotor(LEFT_IN1, LEFT_IN2, 0);
+    setMotor(RIGHT_IN1, RIGHT_IN2, 0);
+    otaRunning = true;
+    Serial.println("OTA update starting");
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA done; restarting"); });
+  ArduinoOTA.onError([](ota_error_t e) {
+    otaRunning = false;
+    Serial.printf("OTA failed (%u)\n", e);
+  });
+  ArduinoOTA.begin();
+}
+
+// Keep the home network. A hotspot that restarts drops every client, and sitting
+// in STA mode disconnected forever is no use to anybody.
+void holdHomeWiFi() {
+  static uint32_t lostSince = 0;
+  static uint32_t lastTry = 0;
+  if (!joinedHome) return;
+  if (WiFi.status() == WL_CONNECTED) { lostSince = 0; return; }
+  uint32_t now = millis();
+  if (lostSince == 0) {
+    lostSince = now;
+    Serial.printf("[%lu ms] lost \"%s\"; trying to get it back\n", now, HOME_SSID);
+  }
+  if (now - lastTry > 5000) {
+    lastTry = now;
+    WiFi.reconnect();
+  }
+  if (now - lostSince > RECONNECT_PATIENCE_MS) {
+    Serial.println("still no home network: making our own instead");
+    joinedHome = false;
+    lostSince = 0;
+    httpd_stop(server);
+    server = NULL;
+    startWiFi();
+    startServer();
+  }
 }
 
 // ---------- main ----------
@@ -955,12 +1008,15 @@ void distanceSelfTest() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
+  if (otaRunning) { delay(5); return; }  // nothing else matters mid-update
   if (Serial.available()) {
     char c = Serial.read();
     if (c == 'p') cameraSelfTest();
     if (c == 'd') distanceSelfTest();
   }
   updateDistance();
+  holdHomeWiFi();
   retryHomeWiFi();
   // Read in reverse of the write order (time, then targets) since commands arrive on another core
   bool active = targetLeft || targetRight;

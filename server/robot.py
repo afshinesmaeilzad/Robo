@@ -66,6 +66,7 @@ class Robot:
         self._ws: websockets.ClientConnection | None = None
         self._lock = asyncio.Lock()
         self._http = httpx.AsyncClient(timeout=timeout)
+        self.failures = 0  # consecutive failed requests, for the watchdog
 
     # ---------- connection ----------
 
@@ -170,28 +171,47 @@ class Robot:
         async with self._lock:
             if size:
                 await self._http.get(f"http://{self.host}/set", params={"size": size})
-            last = "unknown"
-            for attempt in range(2):
-                try:
-                    r = await self._http.get(f"http://{self.host}/jpg", timeout=10.0)
-                    r.raise_for_status()
-                    return r.content
-                except Exception as exc:  # noqa: BLE001
-                    # Timeouts stringify to "", which says nothing in a log
-                    last = str(exc) or type(exc).__name__
-                    if attempt == 0:
-                        await asyncio.sleep(0.3)
-            raise RobotError(f"no picture from the robot ({last})")
+            try:
+                return (await self._get("/jpg", timeout=10.0)).content
+            except RobotError as exc:
+                raise RobotError(f"no picture from the robot ({exc})") from exc
+
+    async def _fresh_http(self) -> None:
+        """Throw the connection pool away and start again.
+
+        When the robot disappears and comes back, the pooled connections are dead
+        and every request keeps failing even though the robot is answering others
+        perfectly well. A new client costs nothing and clears it.
+        """
+        old, self._http = self._http, httpx.AsyncClient(timeout=self.timeout)
+        try:
+            await old.aclose()
+        except Exception:  # noqa: BLE001 - it was broken anyway
+            pass
+
+    async def _get(self, path: str, params: dict | None = None, timeout: float | None = None):
+        """GET something from the robot, with one retry on a new connection."""
+        last = "unknown"
+        for attempt in range(2):
+            try:
+                r = await self._http.get(f"http://{self.host}{path}", params=params,
+                                         timeout=timeout or self.timeout)
+                r.raise_for_status()
+                self.failures = 0
+                return r
+            except Exception as exc:  # noqa: BLE001
+                last = str(exc) or type(exc).__name__
+                if attempt == 0:
+                    await self._fresh_http()
+                    await asyncio.sleep(0.3)
+        self.failures += 1
+        raise RobotError(f"{path} failed ({last})")
 
     async def _set(self, **params) -> None:
-        """A /set call that says so when it fails, instead of throwing a bare httpx
-        error up through the mission loop."""
         try:
-            r = await self._http.get(f"http://{self.host}/set", params=params)
-            r.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
-            raise RobotError(f"could not change {list(params)[0]} "
-                             f"({str(exc) or type(exc).__name__})") from exc
+            await self._get("/set", params)
+        except RobotError as exc:
+            raise RobotError(f"could not change {list(params)[0]}: {exc}") from exc
 
     async def set_speed(self, speed: int) -> None:
         wanted = max(80, min(int(speed), 255))
@@ -215,8 +235,7 @@ class Robot:
 
     async def info(self) -> dict:
         try:
-            r = await self._http.get(f"http://{self.host}/info")
-            return r.json()
+            return (await self._get("/info")).json()
         except Exception:  # noqa: BLE001 - /info is optional (robo_lite has none)
             return {}
 
