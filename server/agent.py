@@ -41,8 +41,10 @@ SHOVE_SPEED = 230     # a firm push, for "knock it over" and "throw it"
 NUDGE_STOP_CM = 5     # how close the robot may get while deliberately touching
 NORMAL_STOP_CM = 20   # ...and what it goes back to afterwards
 MAX_HICCUPS = 3  # consecutive failed steps before a mission gives up
-DITHER_STEPS = 6      # look back this many steps...
-DITHER_CM = 40        # ...and if it has got this far or less, say so
+DITHER_STEPS = 8      # look back this many steps...
+DITHER_CM = 25        # ...and if it has got this far or less, say so
+# 6 steps and 40 cm nagged a robot that was picking its way round chair legs,
+# which is slow but not aimless.
 
 
 def why(exc: Exception) -> str:
@@ -68,6 +70,9 @@ How the robot moves:
   obstacle. The floor in the lower half of the picture is the path ahead.
 - People and pets are obstacles like any other: pass them at about half a metre
   and carry on. Never drive into one, but do not retreat from the room either.
+- Half a metre of space is room to drive, not a wall. Only under 20 cm is forward
+  actually refused; between 20 and 45 cm take short steps; beyond that travel
+  normally. Backing away from something a metre off wastes the mission.
 - If a range finder is fitted, you are told how far the nearest thing straight
   ahead is after every move. It sees what the camera cannot: anything closer than
   about 30 cm, and low things below the camera's view. Under 20 cm the robot
@@ -609,8 +614,12 @@ class Agent:
             return (f" Range finder: {cm} cm ahead - TOO CLOSE, the robot refuses to drive "
                     "forward until you turn or back away.")
         if cm < CLOSE_AHEAD_CM:
-            return f" Range finder: {cm} cm ahead - close, turn or move in small steps."
-        return f" Range finder: {cm} cm of clear space ahead."
+            return (f" Range finder: {cm} cm ahead - close. A short step of 200-300 ms is "
+                    "still fine; anything longer will reach it.")
+        if cm < 100:
+            return (f" Range finder: {cm} cm ahead - room for a move of about "
+                    f"{cm // 20 * 100} ms before anything is in the way.")
+        return f" Range finder: {cm} cm ahead - plenty of room to drive."
 
     async def _look_after_move(self, moved_ms: int) -> tuple[str, str | None]:
         """Picture after a move, with a stuck check when the move was long enough."""

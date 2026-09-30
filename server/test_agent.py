@@ -365,7 +365,8 @@ async def main() -> int:
     await agent10.run("find the ball", max_steps=4)
     replies = " ".join(m.get("content", "") for msgs in [stub10.seen[-1]] for m in msgs
                        if m.get("role") == "tool" and isinstance(m.get("content"), str))
-    checks.append(("clear space is reported", "120 cm of clear space" in replies, replies[:160]))
+    checks.append(("clear space is reported as plenty of room",
+                   "120 cm ahead - plenty of room" in replies, replies[:160]))
 
     # no sensor fitted: nothing is said about range at all
     events.clear()
@@ -491,7 +492,7 @@ async def main() -> int:
 
     replies = " ".join(m.get("content", "") for m in stub17.seen[-1]
                        if m.get("role") == "tool" and isinstance(m.get("content"), str))
-    checks.append(("look reports the distance too", "60 cm of clear space" in replies,
+    checks.append(("look reports the distance too", "60 cm ahead - room for a move" in replies,
                    replies[:200]))
     reminder = next((m["content"] for m in stub17.seen[-1]
                      if isinstance(m.get("content"), str)
