@@ -86,7 +86,9 @@ def neighbours() -> list[str]:
 
 async def _is_robot(client: httpx.AsyncClient, host: str) -> bool:
     try:
-        r = await client.get(f"http://{host}/info", timeout=1.5)
+        # A tired hotspot takes the best part of a second for a round trip, so
+        # 1.5 s was calling a robot that answers "not there".
+        r = await client.get(f"http://{host}/info", timeout=4.0)
         data = r.json()
     except Exception:  # noqa: BLE001 - nearly every address will refuse or time out
         return False

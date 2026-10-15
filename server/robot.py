@@ -20,6 +20,10 @@ from websockets.protocol import State
 
 DIRECTIONS = {"f", "b", "l", "r", "fl", "fr", "bl", "br", "s"}
 
+# A picture over a tired hotspot has been measured at 3-15 s, so waiting 10 was
+# throwing away pictures that were on their way.
+PICTURE_TIMEOUT = 25.0
+
 # How the robot moves per second at full speed (255). Measure yours and put the
 # numbers in .env: drive forward 2 s, measure the distance; spin 2 s, count turns.
 @dataclass
@@ -67,6 +71,7 @@ class Robot:
         self._lock = asyncio.Lock()
         self._http = httpx.AsyncClient(timeout=timeout)
         self.failures = 0  # consecutive failed requests, for the watchdog
+        self.picture_size = "qvga"  # what actually came through last time
 
     # ---------- connection ----------
 
@@ -162,19 +167,32 @@ class Robot:
 
     # ---------- camera ----------
 
+    # Smaller pictures to fall back to when the link cannot carry the big one
+    SMALLER = {"vga": "qvga", "qvga": "qqvga"}
+
     async def picture(self, size: str | None = None) -> bytes:
         """One JPEG. `size` is qqvga, qvga or vga.
 
-        A picture can take a moment (warm-up frames, and the flash settling in
-        the dark), and WiFi drops the odd packet, so one retry is worth it.
+        A picture takes a moment (warm-up frames, the flash settling in the dark)
+        and a weak link makes it much longer, so the timeout is generous. If a
+        size will not come through at all, a smaller one is tried: a small
+        picture beats no picture.
         """
         async with self._lock:
-            if size:
-                await self._http.get(f"http://{self.host}/set", params={"size": size})
-            try:
-                return (await self._get("/jpg", timeout=10.0)).content
-            except RobotError as exc:
-                raise RobotError(f"no picture from the robot ({exc})") from exc
+            want = size or "qvga"
+            last = None
+            while want:
+                try:
+                    await self._get("/set", {"size": want})
+                    jpeg = (await self._get("/jpg", timeout=PICTURE_TIMEOUT)).content
+                    self.picture_size = want
+                    return jpeg
+                except RobotError as exc:
+                    last = exc
+                    want = self.SMALLER.get(want)
+                    if want:
+                        print(f"picture failed, trying {want}: {exc}")
+            raise RobotError(f"no picture from the robot ({last})")
 
     async def _fresh_http(self) -> None:
         """Throw the connection pool away and start again.

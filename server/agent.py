@@ -41,6 +41,7 @@ SHOVE_SPEED = 230     # a firm push, for "knock it over" and "throw it"
 NUDGE_STOP_CM = 5     # how close the robot may get while deliberately touching
 NORMAL_STOP_CM = 20   # ...and what it goes back to afterwards
 MAX_HICCUPS = 3  # consecutive failed steps before a mission gives up
+UNREACHABLE_LIMIT = 5  # failed commands in a row before calling the robot gone
 DITHER_STEPS = 8      # look back this many steps...
 DITHER_CM = 25        # ...and if it has got this far or less, say so
 # 6 steps and 40 cm nagged a robot that was picking its way round chair legs,
@@ -408,6 +409,7 @@ class Agent:
         self.last_sonar: dict | None = None  # last range reading, for the dashboard
         self.recent_places: list[tuple[float, float]] = []  # to notice going nowhere
         self.last_nudge_step = -99
+        self.unreachable = 0            # failed commands in a row
         self.escape_turn = "r"          # alternates, so escapes don't repeat
         self.finish_questioned = False  # an early finish is questioned once
         self.start_distance = 0.0       # how far the robot had driven when this mission began
@@ -782,6 +784,7 @@ class Agent:
         self.start_distance = self.robot.pose.distance
         self.recent_places = []
         self.last_nudge_step = -99
+        self.unreachable = 0
         cal = self.robot.cal
         self.brain = make_brain(self.client, self.model, TOOLS, self.reasoning_effort, self.api)
         self.brain.start(
@@ -844,9 +847,23 @@ class Agent:
                     self.log("tool", f"{call.name}({json.dumps(call.args)[:200]})")
                     try:
                         text, b64 = await self._run_tool(call.name, call.args)
-                    except RobotError as exc:
-                        text, b64 = f"Robot problem: {exc}", None
-                        self.log("error", str(exc))
+                    except (RobotError, Exception) as exc:  # noqa: BLE001
+                        # A blip is worth carrying on through; a robot that has
+                        # stopped answering at all is not, and retrying it just
+                        # burns the mission's steps on nothing.
+                        self.unreachable += 1
+                        text, b64 = (f"Robot problem: {why(exc)}. "
+                                     f"({self.unreachable} in a row.)"), None
+                        self.log("error" if isinstance(exc, RobotError) else "hiccup",
+                                 f"{call.name}: {why(exc)}")
+                        if self.unreachable >= UNREACHABLE_LIMIT:
+                            raise RobotError(
+                                f"the robot stopped answering ({self.unreachable} failed "
+                                f"commands in a row; last: {why(exc)}). Check it is powered "
+                                "on and in WiFi range."
+                            ) from exc
+                    else:
+                        self.unreachable = 0
                     self.brain.add_tool_result(call, text)
                     if b64:
                         self.brain.add_user_image(

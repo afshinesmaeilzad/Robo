@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 from agent import Agent
 from memory import Memory, Note
-from robot import Calibration, FakeRobot
+from robot import Calibration, FakeRobot, RobotError
 from vision_index import VisionIndex, similarity, fingerprint
 
 
@@ -707,6 +707,25 @@ async def main() -> int:
                    not m24.contact_ok and robot24.stop_cm == [] and
                    not any(mv.direction == "f" for mv in robot24.moves),
                    f"contact_ok={m24.contact_ok}, stops={robot24.stop_cm}"))
+
+    # --- a robot that has stopped answering ends the mission, not the step budget ---
+    class DeadRobot(FakeRobot):
+        async def picture(self, size=None):
+            raise RobotError("no picture from the robot (ConnectTimeout)")
+
+        async def move(self, direction, ms):
+            raise RobotError("cannot reach the robot (ConnectTimeout)")
+
+    events.clear()
+    tmp26 = Path(tempfile.mkdtemp())
+    keep_trying = [("Look.", [tool_call(str(i), "look", reason="retry")]) for i in range(30)]
+    agent26 = Agent(DeadRobot(Calibration()), Memory(tmp26), StubModel(keep_trying), "stub",
+                    lambda k, t: events.append((k, t)), index=VisionIndex(tmp26))
+    m26 = await agent26.run("find the bear", max_steps=30)
+    checks.append(("an unreachable robot stops the mission early", m26.steps <= 8,
+                   f"{m26.steps} steps used"))
+    checks.append(("and says the robot stopped answering",
+                   m26.error and "stopped answering" in m26.error, str(m26.error)))
 
     failed = 0
     for name, ok, detail in checks:
