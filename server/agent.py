@@ -1,0 +1,958 @@
+"""The exploring agent.
+
+A GPT model with vision drives the robot through a handful of tools. The server
+keeps the parts a language model is bad at: where the robot is (dead reckoning),
+what it has already seen (memory), and the limits that stop it hurting itself
+(how far one move may go, how many steps a mission may take).
+
+Pictures are expensive, in tokens and in WiFi, so the model is pushed to plan
+several moves from one picture with follow_path() rather than looking after
+every step.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+from openai import AsyncOpenAI
+
+from llm import Call, Reply, make_brain
+
+from memory import Memory, Note
+from robot import Robot, RobotError
+from vision_index import (FAMILIAR, SAME_VIEW, STUCK_VIEW, Shot, VisionIndex,
+                          fingerprint, similarity)
+
+# Below this much travel, an early finish() is questioned once: a model that
+# reads "stop when you get there" literally tends to stop at the first glimpse.
+MIN_TRAVEL_CM = 150
+# A target mission that stops after a few pictures from one spot has not searched:
+# it has usually just believed an old note.
+MIN_TARGET_LOOKS = 6
+STALL_SPEED = 230  # tired batteries will not turn the wheels much below this
+NUDGE_SPEED = 150     # a tap, at walking pace
+SHOVE_SPEED = 230     # a firm push, for "knock it over" and "throw it"
+NUDGE_STOP_CM = 5     # how close the robot may get while deliberately touching
+NORMAL_STOP_CM = 20   # ...and what it goes back to afterwards
+MAX_HICCUPS = 3  # consecutive failed steps before a mission gives up
+UNREACHABLE_LIMIT = 5  # failed commands in a row before calling the robot gone
+DITHER_STEPS = 8      # look back this many steps...
+DITHER_CM = 25        # ...and if it has got this far or less, say so
+# 6 steps and 40 cm nagged a robot that was picking its way round chair legs,
+# which is slow but not aimless.
+
+
+def why(exc: Exception) -> str:
+    """A message that is never empty: timeouts and read errors stringify to ""."""
+    return str(exc) or type(exc).__name__
+CLOSE_AHEAD_CM = 45  # under this, the range finder is worth mentioning
+MIN_SEARCH_CM = 100
+
+BASE_PROMPT = """You are driving a small two-wheel robot with a camera around an indoor space.
+
+Rule one: do not crash. The robot has no bumper or distance sensor: the camera is all you have.
+
+How the robot moves:
+- "f"/"b" drive forward/back, "l"/"r" spin in place, "fl"/"fr"/"bl"/"br" curve.
+- Moves are measured in milliseconds. A 1000 ms forward move is roughly {cm_per_sec:.0f} cm;
+  a 1000 ms spin is roughly {deg_per_sec:.0f} degrees. These are estimates, not exact.
+- set_speed() sets motor power, 80 to 255, and both distances above scale with it.
+  Use 200-255 normally. Crawl at 150-180 only for the last few centimetres of an
+  approach, and go back up afterwards: as the batteries tire the wheels stop
+  turning at all below about 200, and the robot then sits still while thinking it
+  has moved. If a move changes nothing, suspect the speed before the room.
+- The camera looks forward and low. Something close and large in the picture is an
+  obstacle. The floor in the lower half of the picture is the path ahead.
+- People and pets are obstacles like any other: pass them at about half a metre
+  and carry on. Never drive into one, but do not retreat from the room either.
+- Half a metre of space is room to drive, not a wall. Only under 20 cm is forward
+  actually refused; between 20 and 45 cm take short steps; beyond that travel
+  normally. Backing away from something a metre off wastes the mission.
+- If a range finder is fitted, you are told how far the nearest thing straight
+  ahead is after every move. It sees what the camera cannot: anything closer than
+  about 30 cm, and low things below the camera's view. Under 20 cm the robot
+  refuses to drive forward at all, so turn or back away first. It only looks
+  straight ahead: a clear reading says nothing about the sides.
+- Before driving forward, be sure the floor ahead is clear in the last picture.
+  If you are unsure, spin a little and look again instead of driving blind.
+- The server tells you the estimated position after every move. It drifts, so
+  trust the picture over the numbers.
+- If the robot is blocked, the server notices (the view does not change after a
+  move), backs it out and turns it. You are told when that happens: pick a
+  different direction, do not push the same way again.
+- "Robot problem" messages are usually a brief WiFi hiccup, not a broken robot.
+  Try the same thing again, or take a picture; only give up if several attempts
+  in a row fail.
+
+Keep a plan with set_plan(): what you are doing, what you have ruled out, where you
+are heading next. It is shown back to you every step and is the only thing that
+carries your thinking from one picture to the next, so keep it current.
+
+Be brief in your reasoning. Prefer acting to explaining."""
+
+EXPLORE_PROMPT = """
+This mission is EXPLORING AND MAPPING.
+
+- Cover ground. When the floor ahead is clearly open, send several long steps at
+  once: follow_path with 3-6 steps of 1000-2000 ms. Crossing a room or a corridor
+  takes tens of seconds of driving, not one short nudge. Short 300-500 ms steps
+  are only for tight spots and fine aiming.
+- move() is for fine aiming and tight spots only. Three move() calls in a row is a
+  sign you are dithering: use follow_path() instead, which costs one picture for a
+  whole path rather than one per nudge.
+- To go through a doorway or down a corridor: turn to face it, check the picture,
+  then drive through it in one long path rather than stopping every few
+  centimetres.
+- Pictures cost money and WiFi, so plan several moves from each one rather than
+  looking after every step.
+- To save more, the server compares each new picture with the ones it has. If the
+  view has not changed it tells you in words instead of sending the picture
+  again, and if a view matches somewhere you have been it shows you the notes
+  made there. Those hints mean you are going in circles.
+- Call remember() for anything worth keeping: a room, a doorway, a large object,
+  a blocked path. Use recall() before exploring somewhere you may have been.
+- Call finish() only when the goal is really met, or you are truly blocked, or
+  you have run out of steps. Reaching the entrance of somewhere is not the same
+  as having been there: go in, look around and note what is inside first.
+  "Stop for a new mission" means stop when the task is done, not at the first
+  glimpse of the target."""
+
+TARGET_PROMPT = """
+This mission is FINDING AND APPROACHING A TARGET.
+
+- Every picture is sent to you in full, because the target can move and small
+  changes matter. Look often: after most moves, and always before closing in.
+- Searching: spin in place in steps of about 400-600 ms, looking after each, to
+  sweep the whole room before driving off. Then move to a new spot and sweep again.
+- Search the WHOLE picture each time, not just the middle: the target is often
+  small, near the floor, at the edge of the frame, or half behind furniture. Say
+  what you can see of it before deciding it is not there.
+- If something might be the target but is too small or too dark to be sure, drive
+  a little closer and look again before ruling it out.
+- Once you can see the target: centre it in the picture by turning, then approach
+  in short steps (300-600 ms), looking each time. It grows in the frame as you
+  get nearer.
+- Close in slowly. Stop while it is still a little ahead: the camera cannot see
+  the ground right in front of the wheels.
+- Never drive into a person or an animal, and never into anything that could
+  break, spill or fall on the robot: glass, screens, drinks, candles, cables,
+  tall or stacked things. Keep half a metre from people and pets and steer past
+  them; they are obstacles to go round, not reasons to leave the room.
+- Everyday objects on the floor are different. If the goal asks you to reach,
+  touch, push, nudge or "attack" a sturdy small object - a toy, a ball, a shoe,
+  an empty box - you may make contact with nudge() once you can see it close
+  ahead. It is a small robot at walking pace; a push is a push, not damage.
+  Do not use it on anything in the list above, and never on a living thing.
+- You have no arm and no gripper: you cannot pick anything up, throw it, or carry
+  it. What you can do is drive into it. So if the goal says throw, hurl, knock
+  over or send it flying, the nearest thing you can do is a firm shove -
+  nudge(firm=true, ms=800-1500) with clear floor beyond it - and then say plainly
+  that you pushed it rather than threw it, and how far it went.
+- Notes from earlier runs are HINTS ABOUT WHERE TO LOOK, never proof. Things get
+  moved, including by the person who set you this task. A note saying the target
+  was found before does not mean it is there now.
+- Only say you have found the target if you can SEE IT IN THE PICTURE YOU JUST
+  TOOK. Describe where it is in that frame. If you cannot see it, you have not
+  found it, whatever your notes say.
+- Search properly: sweep from where you are, and if the target is not there,
+  DRIVE to another part of the room (1-2 m, several long steps) and sweep again.
+  Turning on the spot only ever shows you one place. Cover several places before
+  concluding it is not there.
+- Call remember() when you find the target, with where it was.
+- Call finish(seen_now=true) when the target is in the picture you just took and
+  you have stopped near it. Use finish(seen_now=false) only after searching
+  several places without finding it."""
+
+TOOLS = [
+    {
+        "name": "look",
+        "description": "Take a picture with the robot's camera and look at it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Why you need to look now."},
+            },
+            "required": ["reason"],
+        },
+    },
+    {
+        "name": "move",
+        "description": "One move, then stop. Use for small corrections.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["f", "b", "l", "r", "fl", "fr", "bl", "br"],
+                },
+                "ms": {"type": "integer", "minimum": 100, "maximum": 2000},
+                "speed": {
+                    "type": "integer", "minimum": 80, "maximum": 255,
+                    "description": "Optional: use this speed for this move onwards.",
+                },
+            },
+            "required": ["direction", "ms"],
+        },
+    },
+    {
+        "name": "follow_path",
+        "description": (
+            "Several moves in a row, then one picture. Preferred way to travel: "
+            "it costs one picture instead of one per move."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "maxItems": 6,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "direction": {
+                                "type": "string",
+                                "enum": ["f", "b", "l", "r", "fl", "fr", "bl", "br"],
+                            },
+                            "ms": {"type": "integer", "minimum": 100, "maximum": 2000},
+                        },
+                        "required": ["direction", "ms"],
+                    },
+                },
+                "purpose": {"type": "string", "description": "What this path is for."},
+                "speed": {
+                    "type": "integer", "minimum": 80, "maximum": 255,
+                    "description": "Optional: use this speed for this path onwards.",
+                },
+            },
+            "required": ["steps"],
+        },
+    },
+    {
+        "name": "remember",
+        "description": "Keep a note about this place, tied to where the robot is now.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Short name, e.g. 'kitchen door'."},
+                "description": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["label", "description"],
+        },
+    },
+    {
+        "name": "nudge",
+        "description": (
+            "Drive gently into the object straight ahead to touch or push it. Only "
+            "for sturdy everyday things the goal told you to reach, touch, push or "
+            "attack, and only when you can see the object close ahead. Never on a "
+            "person, an animal, or anything that could break, spill or topple."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "what": {"type": "string",
+                         "description": "What you are nudging, as you see it right now."},
+                "ms": {"type": "integer", "minimum": 150, "maximum": 1500,
+                       "description": "How long to push for. 300-500 taps it; 800-1500 "
+                                      "shoves it across the floor."},
+                "firm": {"type": "boolean",
+                         "description": "Push hard (more motor power). Use when asked to "
+                                        "knock, shove or throw something, on sturdy objects "
+                                        "only."},
+            },
+            "required": ["what"],
+        },
+    },
+    {
+        "name": "set_speed",
+        "description": (
+            "Motor power, 80 (crawl) to 255 (fast). Slow down to close in on "
+            "something, to squeeze past furniture, or when the range finder says "
+            "the way is tight; speed up to cross open floor."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"speed": {"type": "integer", "minimum": 80, "maximum": 255}},
+            "required": ["speed"],
+        },
+    },
+    {
+        "name": "set_plan",
+        "description": (
+            "Write down what you are doing and what comes next. It is shown back to "
+            "you every step, so use it to keep your bearings: what you are looking "
+            "for, where you have searched, which way you were heading. Update it "
+            "whenever the plan changes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"plan": {"type": "string"}},
+            "required": ["plan"],
+        },
+    },
+    {
+        "name": "recall",
+        "description": "Search earlier notes.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "finish",
+        "description": "End the mission.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "seen_now": {
+                    "type": "boolean",
+                    "description": (
+                        "Target missions: true only if the target is visible in the "
+                        "picture you have just taken. An earlier note is not seeing it."
+                    ),
+                },
+            },
+            "required": ["summary"],
+        },
+    },
+]
+
+
+CONTACT_WORDS = ("attack", "push", "nudge", "bump", "touch", "hit", "knock",
+                 "kick", "shove", "poke", "ram", "throw", "hurl", "topple")
+
+
+def contact_wanted(goal: str) -> bool:
+    """Did the goal ask for the target to be touched, rather than just found?"""
+    return any(w in goal.lower() for w in CONTACT_WORDS)
+
+
+def mode_for(goal: str) -> str:
+    """Guess the kind of mission from how it is worded."""
+    words = goal.lower()
+    hunting = ("find", "look for", "search for", "locate", "follow", "chase",
+               "track", "attack", "fetch", "go to the", "approach", "hunt")
+    return "target" if any(w in words for w in hunting) else "explore"
+
+
+@dataclass
+class Mission:
+    goal: str
+    mode: str = "explore"   # explore = map it and save pictures; target = see everything
+    max_steps: int = 40
+    running: bool = False
+    stop_requested: bool = False
+    steps: int = 0
+    pictures: int = 0      # taken by the camera
+    images_sent: int = 0   # actually sent to the model
+    images_skipped: int = 0  # unchanged views, sent as text instead
+    stuck_events: int = 0    # moves that changed nothing, so an escape was driven
+    plan: str = ""           # the model's own running plan, shown back every step
+    contact_ok: bool = False  # the goal asked for the target to be touched or pushed
+    tokens_in: int = 0
+    tokens_out: int = 0
+    tokens_cached: int = 0  # part of tokens_in that was served from cache
+    started: float = field(default_factory=time.time)
+    finished_summary: str | None = None
+    error: str | None = None
+    ended: str = ""  # why it stopped, in plain words
+
+
+class Agent:
+    def __init__(
+        self,
+        robot: Robot,
+        memory: Memory,
+        client: AsyncOpenAI,
+        model: str,
+        on_event: Callable[[str, str], None],
+        picture_size: str = "qvga",
+        keep_images: int = 3,
+        index: VisionIndex | None = None,
+        image_detail: str = "low",
+        reasoning_effort: str | None = None,
+        target_picture_size: str = "vga",
+        target_image_detail: str = "high",
+    ):
+        self.robot = robot
+        self.memory = memory
+        self.client = client
+        self.model = model
+        self.on_event = on_event
+        self.picture_size = picture_size
+        self.keep_images = keep_images
+        # "low" sends the picture at a fixed small token cost: enough to see a
+        # floor, a doorway or a chair leg, and far cheaper than "high".
+        self.image_detail = image_detail
+        # Looking FOR something needs a good look at it. At low detail the model
+        # gets a heavily downscaled picture: enough to see whether the floor is
+        # clear, nowhere near enough to recognise a small object across a room.
+        self.target_picture_size = target_picture_size
+        self.target_image_detail = target_image_detail
+        self.reasoning_effort = reasoning_effort  # e.g. "none" on models that think
+        self.index = index
+        self.brain = None  # built per mission: it holds that mission's conversation
+        self.api = "auto"  # auto | chat | responses
+        self.mission: Mission | None = None
+        self.last_jpeg: bytes | None = None
+        self.last_shot: Shot | None = None
+        self.last_change: float = 0.0   # how alike the last two pictures were
+        self.last_sonar: dict | None = None  # last range reading, for the dashboard
+        self.recent_places: list[tuple[float, float]] = []  # to notice going nowhere
+        self.last_nudge_step = -99
+        self.unreachable = 0            # failed commands in a row
+        self.escape_turn = "r"          # alternates, so escapes don't repeat
+        self.finish_questioned = False  # an early finish is questioned once
+        self.start_distance = 0.0       # how far the robot had driven when this mission began
+
+    # ---------- helpers ----------
+
+    def detail_now(self) -> str:
+        if self.mission and self.mission.mode == "target":
+            return self.target_image_detail
+        return self.image_detail
+
+    def log(self, kind: str, text: str) -> None:
+        self.on_event(kind, text)
+
+    async def _take_picture(self) -> tuple[str, str | None]:
+        """Take a picture. Returns (what to tell the model, image or None).
+
+        The image is only sent when the view has actually changed: comparing it
+        with what the model has already seen is local work, sending it again is
+        not. Familiar places come with the notes made there.
+        """
+        hunting = bool(self.mission and self.mission.mode == "target")
+        jpeg = await self.robot.picture(
+            self.target_picture_size if hunting else self.picture_size
+        )
+        self.last_jpeg = jpeg
+        pose = self.robot.pose
+        name = self.memory.save_snapshot(jpeg, f"{pose.x:.0f}_{pose.y:.0f}")
+        if self.mission:
+            self.mission.pictures += 1
+
+        # A target mission needs every picture: the target moves, and the
+        # difference between "chair" and "chair with the ball behind it" is
+        # exactly what a similarity score throws away.
+        if self.index is not None and self.mission and self.mission.mode == "target":
+            # Still measure how much the view changed: it is what tells a moving
+            # robot from a stalled one, and a target mission needs that as much
+            # as any other.
+            if self.last_shot is not None:
+                phash, hist = fingerprint(jpeg)
+                self.last_change = similarity(phash, hist,
+                                              self.last_shot.phash, self.last_shot.hist)
+            else:
+                self.last_change = 0.0
+            self.last_shot = self.index.add(jpeg, name, pose.x, pose.y, pose.heading, sent=True)
+            self.mission.images_sent += 1
+            self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {pose.as_text()}")
+            return "Picture taken, see the next message.", base64.b64encode(jpeg).decode()
+
+        if self.index is None:
+            self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {pose.as_text()}")
+            return "Picture taken, see the next message.", base64.b64encode(jpeg).decode()
+
+        # The new picture is not in the index yet, so nothing needs excluding
+        matches = self.index.matches(jpeg)
+        best = matches[0] if matches else None
+        # How much did the view change since the previous picture? That is what
+        # tells a blocked robot from a moving one.
+        if self.last_shot is not None:
+            phash, hist = fingerprint(jpeg)
+            self.last_change = similarity(phash, hist, self.last_shot.phash, self.last_shot.hist)
+        else:
+            self.last_change = 0.0
+        unchanged = (
+            best is not None
+            and best[0] >= SAME_VIEW
+            and best[1].sent
+        )
+        shot = self.index.add(jpeg, name, pose.x, pose.y, pose.heading, sent=not unchanged)
+        self.last_shot = shot
+
+        if unchanged:
+            score, old = best
+            if self.mission:
+                self.mission.images_skipped += 1
+            self.log("same", f"{name} is {score * 100:.0f}% the view from {old.where()}: not sent")
+            note = f" Note made there: {old.label}: {old.description}." if old.label else ""
+            return (
+                f"The view has not changed ({score * 100:.0f}% the same as the picture from "
+                f"{old.where()}), so it is not sent again.{note} "
+                "If you expected it to change, the robot may not have moved: try a longer "
+                "move, or turn."
+            ), None
+
+        if self.mission:
+            self.mission.images_sent += 1
+        self.log("picture", f"{name} ({len(jpeg) / 1024:.1f} KB) at {pose.as_text()}")
+        text = "Picture taken, see the next message."
+        familiar = [m for m in matches if m[0] >= FAMILIAR]
+        if familiar:
+            self.log("familiar", f"{len(familiar)} similar view(s) seen before")
+            text += "\nThis place looks familiar:\n" + self.index.context(familiar)
+        return text, base64.b64encode(jpeg).decode()
+
+    def _nudge_if_dithering(self, mission: Mission) -> None:
+        """Say so when it has spent several steps going nowhere.
+
+        Turning and reversing on the spot feels like progress to a model working
+        one picture at a time; from outside it is obvious that the robot has not
+        been anywhere.
+        """
+        here = (self.robot.pose.x, self.robot.pose.y)
+        self.recent_places.append(here)
+        if len(self.recent_places) <= DITHER_STEPS:
+            return
+        then = self.recent_places[-DITHER_STEPS - 1]
+        moved = math.dist(then, here)
+        if moved > DITHER_CM or mission.steps - self.last_nudge_step < DITHER_STEPS:
+            return
+        self.last_nudge_step = mission.steps
+        self.log("dithering", f"{moved:.0f}cm in {DITHER_STEPS} steps")
+        if mission.mode == "target":
+            self.brain.add_user_text(
+                f"You have moved {moved:.0f} cm in the last {DITHER_STEPS} steps, mostly "
+                "turning. If you can see the target, stop aiming and drive at it: a few "
+                "short forward steps, correcting between them, gets there faster than "
+                "another turn. If you cannot see it, leave this spot and search "
+                "somewhere else."
+            )
+        else:
+            self.brain.add_user_text(
+                f"You have moved {moved:.0f} cm in the last {DITHER_STEPS} steps: you are "
+                "turning and reversing in one spot, not exploring. Pick the most open "
+                "direction you can see and commit to it with follow_path - several steps "
+                "of 1000-1500 ms at speed 200 or more. If every direction really is "
+                "blocked, say so and finish."
+            )
+
+    def _remind(self, mission: Mission) -> None:
+        """Put the running plan, position, speed and range at the end of the talk.
+
+        The tail is cheap to change; the system prompt is not, because changing it
+        would throw away the cached prefix and cost ten times as much per step.
+        """
+        if not mission.plan:
+            self.brain.set_reminder("")
+            return
+        where = [f"You are at {self.robot.pose.as_text()}",
+                 f"motor speed {self.robot.cal.speed} of 255",
+                 f"step {mission.steps} of {mission.max_steps}"]
+        if self.last_sonar and self.last_sonar.get("cm", -1) >= 0:
+            cm = self.last_sonar["cm"]
+            where.insert(1, f"last range reading {cm} cm ahead"
+                            + (" (too close for forward)" if self.last_sonar.get("blocked") else ""))
+        self.brain.set_reminder(
+            f"Your plan, as you last wrote it: {mission.plan}\n" + ", ".join(where) + "."
+        )
+
+    def _prune_images(self) -> None:
+        """Older pictures lose their pixels but keep their text: where they were
+        taken, and what the model said about them, is the thread of its thinking."""
+        self.brain.prune_images(
+            self.keep_images, "- picture no longer shown; your notes on it stand."
+        )
+
+    # ---------- tools ----------
+
+    async def _escape(self) -> str:
+        """Back out of whatever the robot is caught on and turn away from it.
+
+        Often nothing is caught: the batteries have sagged and the wheels will
+        not turn at the speed being asked for, so the escape starts by giving
+        them more power.
+        """
+        self.escape_turn = "l" if self.escape_turn == "r" else "r"
+        if self.mission:
+            self.mission.stuck_events += 1
+        raised = ""
+        if self.robot.cal.speed < STALL_SPEED:
+            try:
+                await self.robot.set_speed(STALL_SPEED)
+                raised = (f" The wheels may simply have stalled at that speed, so I have "
+                          f"raised it to {STALL_SPEED}.")
+                self.log("speed", f"raised to {STALL_SPEED} after a stall")
+            except RobotError:
+                pass
+        self.log("stuck", f"view unchanged after moving; backing up and turning {self.escape_turn}")
+        try:
+            await self.robot.move("b", 600)
+            await self.robot.move(self.escape_turn, 500)
+        except RobotError as exc:
+            return f"Tried to back out but the robot did not answer: {exc}"
+        return (
+            "The view did not change after that move, so the robot is stuck: the wheels are "
+            "blocked, or it is pressed against something the camera cannot see well. "
+            f"I have backed it up and turned it {'left' if self.escape_turn == 'l' else 'right'}."
+            + raised +
+            " Do not push the same way again: pick another direction."
+        )
+
+    async def _sonar_note(self) -> str:
+        """What the range finder sees, as one line for the model (empty if none)."""
+        try:
+            cm, blocked, paused = await self.robot.sonar()
+        except RobotError:
+            return ""
+        self.last_sonar = {"cm": cm, "blocked": blocked, "paused": paused}
+        if paused:
+            return (" Range finder: paused while the light is on (they share a pin). "
+                    "Turn the light off to see distances again.")
+        if cm < 0:
+            return ""  # no sensor fitted, or nothing within its 4 m range
+        if blocked:
+            return (f" Range finder: {cm} cm ahead - TOO CLOSE, the robot refuses to drive "
+                    "forward until you turn or back away.")
+        if cm < CLOSE_AHEAD_CM:
+            return (f" Range finder: {cm} cm ahead - close. A short step of 200-300 ms is "
+                    "still fine; anything longer will reach it.")
+        if cm < 100:
+            return (f" Range finder: {cm} cm ahead - room for a move of about "
+                    f"{cm // 20 * 100} ms before anything is in the way.")
+        return f" Range finder: {cm} cm ahead - plenty of room to drive."
+
+    async def _look_after_move(self, moved_ms: int) -> tuple[str, str | None]:
+        """Picture after a move, with a stuck check when the move was long enough."""
+        text, b64 = await self._take_picture()
+        text += await self._sonar_note()
+        real_move = moved_ms >= 300  # shorter nudges may genuinely change nothing
+        if real_move and self.last_change >= STUCK_VIEW:
+            escape = await self._escape()
+            text2, b64_2 = await self._take_picture()
+            # the range reading matters most right after an escape
+            return f"{escape}\n{text2}{await self._sonar_note()}", b64_2 or b64
+        return text, b64
+
+    # ---------- tools ----------
+
+    async def _run_tool(self, name: str, args: dict) -> tuple[str, str | None]:
+        """Returns (text for the model, base64 picture or None)."""
+        pose = self.robot.pose
+        if name == "look":
+            text, b64 = await self._take_picture()
+            return text + await self._sonar_note(), b64
+
+        if name == "nudge":
+            if not (self.mission and self.mission.contact_ok):
+                return ("This mission did not ask for anything to be touched, so I have "
+                        "not. Say what should be pushed in the goal if you want that."), None
+            ms = int(args.get("ms", 400))
+            firm = bool(args.get("firm"))
+            was_speed = self.robot.cal.speed
+            self.log("nudge", f"{'shoved' if firm else 'nudged'} "
+                              f"{args.get('what', 'something')} for {ms}ms")
+            try:
+                # the range finder normally refuses forward inside 20 cm: that is
+                # exactly the distance a nudge happens at
+                await self.robot.set_stop_distance(NUDGE_STOP_CM)
+                await self.robot.set_speed(SHOVE_SPEED if firm else NUDGE_SPEED)
+                await self.robot.move("f", min(max(ms, 150), 1500))
+            finally:
+                await self.robot.set_stop_distance(NORMAL_STOP_CM)
+                try:
+                    await self.robot.set_speed(was_speed)
+                except RobotError:
+                    pass
+            text, b64 = await self._take_picture()
+            how = "Shoved" if firm else "Nudged"
+            return (f"{how} {args.get('what', 'it')} for {ms} ms. {text}"), b64
+
+        if name == "set_speed":
+            await self.robot.set_speed(args["speed"])
+            self.log("speed", f"motors set to {self.robot.cal.speed}")
+            return (f"Motor speed is now {self.robot.cal.speed} of 255. Distances per "
+                    "second scale with it."), None
+
+        if name == "move":
+            if args.get("speed"):
+                await self.robot.set_speed(args["speed"])
+            await self.robot.move(args["direction"], args["ms"])
+            self.log("move", f"{args['direction']} {args['ms']}ms -> {pose.as_text()}")
+            if self.last_jpeg is None:  # nothing to compare with yet
+                return f"Moved. Estimated position: {pose.as_text()}", None
+            text, b64 = await self._look_after_move(args["ms"])
+            return f"Moved. Estimated position: {pose.as_text()}. {text}", b64
+
+        if name == "follow_path":
+            if args.get("speed"):
+                await self.robot.set_speed(args["speed"])
+            steps = args.get("steps", [])
+            done = []
+            for step in steps:
+                if self.mission and self.mission.stop_requested:
+                    break
+                await self.robot.move(step["direction"], step["ms"])
+                done.append(f"{step['direction']} {step['ms']}ms")
+            self.log("path", f"{' + '.join(done) or 'nothing'} -> {pose.as_text()}")
+            text, b64 = await self._look_after_move(sum(s["ms"] for s in steps[: len(done)]))
+            return (
+                f"Path done ({len(done)} of {len(steps)} steps: {', '.join(done)}). "
+                f"Estimated position: {pose.as_text()}. {text}"
+            ), b64
+
+        if name == "remember":
+            note = self.memory.add(
+                Note(
+                    label=args["label"],
+                    description=args["description"],
+                    tags=args.get("tags", []),
+                    x=pose.x,
+                    y=pose.y,
+                    heading=pose.heading,
+                    image=self.memory.save_snapshot(self.last_jpeg) if self.last_jpeg else None,
+                )
+            )
+            if self.index is not None:
+                self.index.describe(args["label"], args["description"], self.last_shot)
+            self.log("memory", note.as_text())
+            return f"Remembered: {note.as_text()}", None
+
+        if name == "set_plan":
+            if self.mission:
+                self.mission.plan = args["plan"]
+            self.log("plan", args["plan"][:200])
+            return "Plan noted; it will be shown to you each step.", None
+
+        if name == "recall":
+            hits = self.memory.search(args["query"])
+            self.log("recall", f"{args['query']} -> {len(hits)} note(s)")
+            if not hits:
+                return "Nothing remembered about that.", None
+            return "\n".join(n.as_text() for n in hits), None
+
+        if name == "finish":
+            m = self.mission
+            # Finishing after a few centimetres usually means the goal was read
+            # too literally. Push back once; obey if it insists.
+            # Seeing the target now is a good reason to stop. Believing an old
+            # note after two looks from one spot is not.
+            if (m and m.mode == "target" and not args.get("seen_now")
+                    and not self.finish_questioned
+                    and (m.pictures < MIN_TARGET_LOOKS
+                         or self.robot.pose.distance - self.start_distance < MIN_SEARCH_CM)):
+                self.finish_questioned = True
+                moved = self.robot.pose.distance - self.start_distance
+                self.log("keep-going",
+                         f"finish after {m.pictures} pictures and {moved:.0f}cm of searching")
+                return (
+                    f"You have taken {m.pictures} pictures and driven {moved:.0f} cm. That is "
+                    "one spot, not a search, and an earlier note is not proof: the target may "
+                    "have been moved since. Unless you can see the target in the picture you "
+                    "just took, drive to another part of the room and sweep again from there. "
+                    "Call finish() again if you truly cannot find it."
+                ), None
+            if (m and m.mode == "explore" and m.steps < m.max_steps // 3
+                    and self.robot.pose.distance < MIN_TRAVEL_CM
+                    and not self.finish_questioned):
+                self.finish_questioned = True
+                self.log("keep-going", f"finish after only {self.robot.pose.distance:.0f}cm")
+                return (
+                    f"You have driven only {self.robot.pose.distance:.0f} cm and used "
+                    f"{m.steps} of {m.max_steps} steps. That is not much of the space yet. "
+                    "Unless you are blocked, keep going: drive further, look around the "
+                    "next corner, and note what you find. Call finish() again if you are "
+                    "certain the goal is met."
+                ), None
+            if m:
+                m.finished_summary = args["summary"]
+            self.log("finish", args["summary"])
+            return "Mission ended.", None
+
+        return f"Unknown tool {name}.", None
+
+    # ---------- the loop ----------
+
+    async def run(self, goal: str, max_steps: int, mode: str = "auto") -> Mission:
+        if mode not in ("explore", "target"):
+            mode = mode_for(goal)
+        mission = Mission(goal=goal, mode=mode, max_steps=max_steps, running=True,
+                          contact_ok=contact_wanted(goal))
+        self.mission = mission
+        self.finish_questioned = False
+        self.start_distance = self.robot.pose.distance
+        self.recent_places = []
+        self.last_nudge_step = -99
+        self.unreachable = 0
+        cal = self.robot.cal
+        self.brain = make_brain(self.client, self.model, TOOLS, self.reasoning_effort, self.api)
+        self.brain.start(
+            BASE_PROMPT.format(
+                cm_per_sec=cal.cm_per_sec * cal.speed / 255,
+                deg_per_sec=cal.deg_per_sec * cal.speed / 255,
+            ) + (EXPLORE_PROMPT if mode == "explore" else TARGET_PROMPT),
+            f"Goal: {goal}\n\n"
+            f"Starting position: {self.robot.pose.as_text()}\n"
+            f"Notes from earlier runs (they may be out of date; the room and the "
+            f"things in it can have been moved since):\n"
+            f"{self.memory.briefing(goal)}\n\n"
+            + ("Those notes are hints about where to look. Trust only what you "
+               "see in the pictures you take now.\n\n" if mode == "target" else "")
+            + ("This goal asks you to touch or push the target. If it is a sturdy "
+               "everyday object - not a person, an animal, or anything breakable - "
+               "use nudge() when you can see it close ahead.\n\n"
+               if contact_wanted(goal) else "")
+            + "Start by looking around.",
+        )
+        self.log("start", f"[{mode}] {goal}")
+        hiccups = 0  # consecutive failed steps: a few are normal on a phone hotspot
+        try:
+            while mission.running and mission.steps < mission.max_steps:
+                if mission.stop_requested:
+                    self.log("stop", "stopped by the user")
+                    break
+                mission.steps += 1
+                left = mission.max_steps - mission.steps
+                if left in (5, 2):
+                    self.brain.add_user_text(
+                        f"{left} steps left before this mission is stopped. Finish what "
+                        "you are doing: if you can see the target or have something worth "
+                        "keeping, remember() it now and call finish()."
+                    )
+                self._prune_images()
+                self._nudge_if_dithering(mission)
+                self._remind(mission)
+                try:
+                    reply = await self._ask_with_retry()
+                except Exception as exc:  # noqa: BLE001 - usually a dropped packet
+                    hiccups += 1
+                    self.log("hiccup", f"{why(exc)} (attempt {hiccups} of {MAX_HICCUPS})")
+                    if hiccups >= MAX_HICCUPS:
+                        raise
+                    await asyncio.sleep(2)
+                    continue
+                hiccups = 0
+
+                mission.tokens_in += reply.tokens_in
+                mission.tokens_out += reply.tokens_out
+                mission.tokens_cached += reply.tokens_cached
+                if reply.text:
+                    self.log("think", reply.text.strip())
+                if not reply.calls:
+                    self.brain.add_user_text("Use a tool, or call finish() to stop.")
+                    continue
+
+                for call in reply.calls:
+                    self.log("tool", f"{call.name}({json.dumps(call.args)[:200]})")
+                    try:
+                        text, b64 = await self._run_tool(call.name, call.args)
+                    except (RobotError, Exception) as exc:  # noqa: BLE001
+                        # A blip is worth carrying on through; a robot that has
+                        # stopped answering at all is not, and retrying it just
+                        # burns the mission's steps on nothing.
+                        self.unreachable += 1
+                        text, b64 = (f"Robot problem: {why(exc)}. "
+                                     f"({self.unreachable} in a row.)"), None
+                        self.log("error" if isinstance(exc, RobotError) else "hiccup",
+                                 f"{call.name}: {why(exc)}")
+                        if self.unreachable >= UNREACHABLE_LIMIT:
+                            raise RobotError(
+                                f"the robot stopped answering ({self.unreachable} failed "
+                                f"commands in a row; last: {why(exc)}). Check it is powered "
+                                "on and in WiFi range."
+                            ) from exc
+                    else:
+                        self.unreachable = 0
+                    self.brain.add_tool_result(call, text)
+                    if b64:
+                        self.brain.add_user_image(
+                            f"Camera view at {self.robot.pose.as_text()}", b64, self.detail_now()
+                        )
+                    # Only a finish that was accepted ends the mission: an early
+                    # one is answered with "keep going" instead.
+                    if call.name == "finish" and mission.finished_summary:
+                        mission.running = False
+        except asyncio.CancelledError:
+            self.log("stop", "mission cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001 - anything else ends the mission safely
+            mission.error = why(exc)
+            self.log("error", why(exc))
+        finally:
+            if mission.stop_requested:
+                mission.ended = "stopped by you"
+            elif mission.error:
+                mission.ended = f"error: {mission.error}"
+            elif mission.finished_summary:
+                mission.ended = "the model called finish()"
+            elif mission.steps >= mission.max_steps:
+                mission.ended = (
+                    f"ran out of steps ({mission.max_steps}). Raise the step limit and "
+                    "start again to carry on."
+                )
+            else:
+                mission.ended = "stopped"
+            mission.running = False
+            try:
+                await self.robot.stop()
+            except RobotError:
+                pass
+            self.memory.save()
+            self.log("end", f"{mission.ended}"
+                            + (f" - {mission.finished_summary}" if mission.finished_summary else ""))
+        return mission
+
+    async def _ask_with_retry(self, tries: int = 3) -> Reply:
+        """The internet shares a phone hotspot with the robot, so one failed call
+        is not news. A model that refuses reasoning with tools is, though: that
+        one is answered by moving to the API that allows both."""
+        for attempt in range(tries):
+            try:
+                return await self.brain.ask()
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc).lower()
+                if "reasoning" in message and "not supported" in message:
+                    if self.api != "responses" and hasattr(self.client, "responses"):
+                        self.log("model", "this model wants /v1/responses for tools with "
+                                          "reasoning; switching to it")
+                        self.api = "responses"
+                        self._rebuild_brain()
+                        continue
+                    self.log("model", "this model will not think while using tools; "
+                                      "carrying on without reasoning")
+                    self.reasoning_effort = None
+                    self.api = "chat"
+                    self._rebuild_brain()
+                    continue
+                if attempt == tries - 1:
+                    raise
+                self.log("retry", f"model call failed ({why(exc)}), trying again")
+                await asyncio.sleep(1.5 * (attempt + 1))
+        raise RuntimeError("unreachable")
+
+    def _rebuild_brain(self) -> None:
+        """Move the conversation to the other API, keeping what has been said."""
+        old = self.brain
+        fresh = make_brain(self.client, self.model, TOOLS, self.reasoning_effort, self.api)
+        fresh.start(getattr(old, "system", "") or self._system_of(old), self._first_user_of(old))
+        self.brain = fresh
+
+    @staticmethod
+    def _system_of(brain) -> str:
+        for item in brain.items:
+            if item.get("role") == "system":
+                return item.get("content", "")
+        return ""
+
+    @staticmethod
+    def _first_user_of(brain) -> str:
+        for item in brain.items:
+            if item.get("role") == "user":
+                content = item.get("content")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    return next((p.get("text", "") for p in content
+                                 if p.get("type") in ("text", "input_text")), "")
+        return ""

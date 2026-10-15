@@ -1,0 +1,331 @@
+# Robo brain — GPT explores the room
+
+A small server that sits between the robot and an OpenAI vision model. The model
+gets a camera picture and a handful of tools; the server keeps everything a
+language model is bad at: where the robot is, what it has already seen, and the
+limits that stop it driving into things.
+
+```
+ ┌───────────┐   pictures + tool calls   ┌──────────────┐   ws /ws : commands   ┌──────────┐
+ │  OpenAI   │ ◀───────────────────────▶ │    server    │ ────────────────────▶ │ ESP32-CAM│
+ │  GPT-4.1  │                           │  FastAPI     │ ◀──────────────────── │  robot   │
+ └───────────┘                           │  pose, memory│    GET /jpg : picture └──────────┘
+                                         └──────┬───────┘
+                                    http://localhost:8000 (watch, start, stop)
+```
+
+## Where each setting goes
+
+| What | Where | Example |
+|---|---|---|
+| OpenAI key | `server/.env` | `OPENAI_API_KEY=sk-...` |
+| WiFi name and password | top of `robo_wifi/robo_wifi.ino` | `#define HOME_SSID "my-wifi"` |
+| Robot's address | `server/.env` | `ROBOT_HOST=auto` |
+
+**The robot does not need this machine's address.** The server is the client: it
+opens the connection to the robot, sends the commands and asks for the pictures.
+So your laptop's IP can change, and nothing on the robot has to be updated.
+
+**Finding the robot** works three ways, set by `ROBOT_HOST`:
+
+- `auto` — at startup the server asks every address on the local network whether
+  it answers `/info` like a Robo. Takes a second or two, and works inside Docker.
+  The **🔎 find robot** button on the dashboard does the same at any time.
+- `robo.local` — the name the robot advertises. Works on the host, but usually
+  not inside a container.
+- `192.168.1.42` — the address the robot prints on the serial monitor at boot.
+
+## Setup
+
+1. **Key.** Copy the example and paste your key. `.env` is git-ignored, so the
+   key stays on this machine and never reaches GitHub or the Docker image.
+
+   ```bash
+   cp server/.env.example server/.env
+   ```
+
+2. **Put the robot on your home WiFi.** In `robo_wifi/robo_wifi.ino`, fill in
+
+   ```cpp
+   #define HOME_SSID "your-network"
+   #define HOME_PASS "your-password"
+   ```
+
+   then flash it. The robot joins that network and prints its address; it also
+   answers to `robo.local`. If it cannot join in 15 s it falls back to making
+   its own `Robo-CAM` network, so a typo never locks you out.
+
+   This matters because the server needs the robot **and** the internet at the
+   same time. On the robot's own network your computer has no internet.
+
+3. **Set `ROBOT_HOST`** in `.env` to the address the robot printed (or
+   `robo.local`). Use `fake` to try the server with no hardware at all.
+
+## Run
+
+With Docker:
+
+```bash
+cd server && docker compose up --build
+```
+
+Without Docker:
+
+```bash
+cd server && pip install -r requirements.txt && uvicorn app:app --port 8000
+```
+
+Then open **http://localhost:8000**: the camera view, the estimated path, the
+live log and the memory, with Start and Stop buttons.
+
+To try the whole thing without hardware, set `ROBOT_HOST=fake` in `.env`.
+
+## Two kinds of mission
+
+The dashboard has a mode next to the goal, and `auto` reads it from the wording:
+
+| Mode | For | Pictures |
+|---|---|---|
+| **explore & map** | learning the layout of a space | unchanged views are **not** sent again; familiar places arrive as notes |
+| **find a target** | finding, approaching or following something | **every** picture is sent in full |
+
+The difference matters. When mapping, a view that has not changed tells the
+model nothing new, so sending it again is wasted money and WiFi. When looking
+for something, the opposite is true: the target moves, and the difference between
+"a chair" and "a chair with the ball behind it" is exactly what a similarity
+score throws away.
+
+The two modes also get different instructions. Exploring is told to cover ground
+in long runs and not to stop at the first glimpse of the target. A target mission
+is told to sweep the room in small turns, look after most moves, centre the
+target before approaching, close in slowly, and never chase a person or an animal
+or drive at anything breakable.
+
+`auto` picks *find a target* when the goal says find, look for, search, locate,
+follow, track, approach or fetch; otherwise it explores.
+
+## Not sending the same picture twice (exploring)
+
+Every snapshot is fingerprinted **locally** (`vision_index.py`): a 64-bit
+difference hash of its structure, plus a colour histogram. Comparing those takes
+microseconds and needs no model, so before anything goes to OpenAI the server
+can answer two questions:
+
+- **"Is this the same view I already sent?"** At 95% similar or above, the
+  picture is *not* sent again. The model gets a line of text instead: the view
+  has not changed, and the note made there. A robot that is stuck against a
+  chair therefore costs a few tokens per step instead of a picture per step.
+- **"Have I been here before?"** At 90% or above, the notes made at those
+  earlier views are added as text, so the model is told it is going in circles
+  and can use what it learned last time.
+
+`remember()` ties the note to the picture it was made from, so the index grows
+into a small searchable memory of places: fingerprint, position and description.
+It is kept in `data/vision_index.json` and loaded at startup.
+
+The dashboard shows the count: **pictures taken, sent, skipped**.
+
+## When the robot cannot move
+
+A wheel catches on a rug, the robot noses into a chair leg, the battery sags
+under load: the command is sent, the position estimate moves, and the robot
+stays exactly where it was.
+
+The server catches this with the same fingerprints: after a move of 300 ms or
+more, if the new picture is **95% or more** the same as the one before it, the
+robot did not actually move. The server then drives an escape by itself —
+**back 600 ms, then turn 500 ms**, turning the other way each time so it doesn't
+repeat the same escape — takes a fresh picture, and tells the model what
+happened, so it picks a different direction instead of pushing the same way.
+
+Short nudges under 300 ms are exempt: they may genuinely change nothing.
+
+The dashboard counts these as **stuck Nx**.
+
+The range reading goes to the model after every move **and every look**, and the
+step reminder repeats the last one along with the current motor speed, so it
+always knows how much room it has and how fast it is set to move.
+
+## Memory, short and long
+
+**Within a mission.** The last `KEEP_IMAGES` pictures (6 by default) stay in the
+conversation. Older ones lose their pixels but keep their text, so the model
+still knows a picture was taken there and what it said about it — dropping them
+entirely was throwing away the thread of its own reasoning.
+
+It also keeps a **plan** with `set_plan()`: what it is doing, what it has ruled
+out, where it is heading. The plan is shown back at the end of the conversation
+every step, so it survives pictures being pruned. It rides at the tail rather
+than in the system prompt, because changing the prompt would invalidate the
+cached prefix and cost ten times as much per step.
+
+**Between missions.** Notes and the picture index are on disk and loaded at
+startup. A mission opens with a briefing that mixes **notes matching this goal**
+with **the most recent notes** — with a hundred notes stored, the last twenty are
+rarely the right twenty. Everything carries its age and a warning that the room
+may have changed.
+
+## Touching things
+
+Asked to "attack the toy bear", the model used to refuse: my prompt said never
+drive at anything that could be hurt, which reads as never touch anything.
+
+The line is now where it belongs. **Never** a person, an animal, or anything that
+could break, spill or topple — glass, screens, drinks, candles, cables, stacked
+things. **Allowed**, when the goal asks for it, a sturdy object on the floor: a
+toy, a ball, a shoe, an empty box.
+
+`nudge()` drives into it deliberately: 150 speed for a tap, 230 and up to 1.5 s
+for a shove. The range finder normally refuses to go forward inside 20 cm, which
+is exactly where contact happens, so the nudge lowers that limit to 5 cm and puts
+it back afterwards.
+
+It only exists when the goal asked for it — attack, push, bump, touch, knock,
+kick, shove, throw, topple — and a mission that only asked to *find* something
+refuses and says why.
+
+**The robot has no arm**, so it cannot pick anything up or throw it. Asked to
+throw something, it gives it a firm shove and says plainly that it pushed rather
+than threw. That is the honest version of the request, not a refusal.
+
+## How the agent works
+
+The model is given these tools:
+
+| Tool | What it does |
+|---|---|
+| `look(reason)` | takes a picture and shows it to the model |
+| `move(direction, ms, speed)` | one move, then stop — for small corrections |
+| `set_speed(speed)` | motor power 80–255: crawl past furniture, hurry across open floor |
+| `nudge(what, ms, firm)` | drive gently into a sturdy object the goal named — a tap, or a firm shove |
+| `set_plan(plan)` | what it is doing and what comes next, shown back every step |
+| `follow_path(steps, purpose, speed)` | up to 6 moves in a row, then **one** picture |
+| `remember(label, description, tags)` | saves a note with the current position |
+| `recall(query)` | searches earlier notes |
+| `finish(summary)` | ends the mission |
+
+**Fewer pictures.** Pictures cost tokens and WiFi, and the robot's link is the
+weak point. The server therefore tracks the robot's position by dead reckoning
+from the commands it sent (`cm_per_sec`, `deg_per_sec` in `.env`), and tells the
+model where it is after every move. The model is pushed to plan several moves
+from one picture with `follow_path` instead of looking after every step. Older
+pictures are dropped from the conversation, so cost per step stays flat.
+
+**Memory.** Notes go to `data/memories.json` with the position they were made
+from, and every picture is kept in `data/snapshots/`. Notes are loaded at
+startup, so later missions can recall what earlier ones found.
+
+**Old notes are hints, not facts.** Notes from earlier runs are handed over with
+their age ("14 min ago") and a warning that the room may have changed since.
+Without that, a target mission reads "bear lamp reached and viewed" and finishes
+on the spot — even after the lamp has been moved. A target mission may only end
+at once if `finish(seen_now=true)` says the target is in the picture just taken;
+otherwise, having taken fewer than 6 pictures or driven less than a metre, the
+server answers: that is one spot, not a search — go and look somewhere else.
+
+**Keep going (exploring only).** A model told "stop when you get there" tends to stop at the
+first glimpse of the target. If `finish()` is called having driven less than
+150 cm, and less than a third of the steps are used, the server questions it once
+("you have driven only N cm; unless you are blocked, keep going") and obeys a
+second, insistent call.
+
+**Ending.** The dashboard says why a mission stopped: the model called finish(),
+you pressed Stop, an error, or it ran out of steps. The step box next to the goal
+sets that limit (60 by default) — a target mission that has to search a whole
+room needs more than a quick tour of one. Five steps from the end, and again at
+two, the model is told how little is left so it can wrap up rather than being cut
+off mid-approach.
+
+**Safety.** One move is capped at 2 s, a mission at `max_steps` (60 by default),
+and the robot stops by itself 0.5 s after the last command, so a crashed or
+disconnected server leaves the robot standing still rather than driving away.
+Stop ends the mission at the next step.
+
+## When the wheels will not turn
+
+As the motor batteries tire, the robot stops moving at speeds that worked
+yesterday — at 200 the wheels may not turn while at 255 they do. Nothing says
+so: the commands are accepted, the position estimate advances, and the robot
+sits still.
+
+So a stall is treated as an obstacle: the view does not change after a move, the
+server backs up, turns, **and raises the speed to 230**, and tells the model the
+wheels may simply have stalled. The prompt says to drive at 200-255 and to crawl
+only for the last few centimetres of an approach.
+
+If it keeps happening, change the motor batteries. No amount of software makes a
+flat cell turn a wheel.
+
+## Calibration
+
+Dead reckoning is only as good as `CM_PER_SEC` and `DEG_PER_SEC` in `.env`.
+
+With the range finder fitted, the robot can measure its own speed: point it at a
+wall a metre or two away with clear floor between, and press **📐 measure speed**
+(or `POST /api/calibrate`). It drives forward in short bursts, watches the wall
+come closer, and reports cm per second along with the line to put in `.env`.
+
+It takes the median of several runs, because one echo off an angled surface can
+be wildly wrong, and it waits out a full ping between readings — standing still
+the robot only pings once a second, so an immediate answer can describe where it
+was a moment ago.
+
+**🔄 measure turn** (or `POST /api/calibrate_turn`) does the same for turning: the
+robot spins in small steps until the camera sees its starting view again, which
+is one full circle, and works out degrees per second from the time it took.
+
+Both matter more than they sound. Measured on this robot, a full turn takes 10.4
+seconds at speed 200 - 35 degrees per second, where the default guessed 180. The
+model asking for an 804 ms turn was expecting 113 degrees and getting 28, then
+"correcting" the overshoot that never happened. Every aiming attempt was fighting
+a number I made up.
+
+The estimate drifts, especially on carpet. It is a hint for the model, not a map.
+
+## Cost
+
+Each step is one model call with at most a few small pictures. At 320×240 a
+picture is a few hundred tokens. `PICTURE_SIZE=qqvga` and a smaller `max_steps`
+keep a mission cheap while you experiment, and unchanged views cost text rather
+than an image.
+
+Pictures are sent at **low detail** by default (`IMAGE_DETAIL=low`): a fixed,
+small token cost, and enough to see a floor, a doorway or a chair leg. `high`
+costs several times more for detail this robot does not need.
+
+On a model that thinks before answering, `REASONING_EFFORT` (none | minimal |
+low | medium | high) trades speed for judgement. `medium` suits driving around
+furniture; `none` is cheapest and fastest.
+
+**Which API.** Some models refuse function tools and reasoning together on Chat
+Completions:
+
+> Function tools with reasoning_effort are not supported for gpt-6-luna in
+> /v1/chat/completions. To use function tools, use /v1/responses…
+
+So the server picks the API to match the run: **Responses** when reasoning is
+wanted (it also feeds the model's reasoning back between tool calls, so it keeps
+its train of thought), **Chat Completions** otherwise, which is simpler and
+cheaper. If a model refuses mid-mission it switches across by itself rather than
+failing, and if neither will think with tools it carries on without reasoning.
+
+The dashboard shows tokens in (and how many of those were cached), tokens out,
+seconds per step and an estimated price. **Set the prices in `.env` to match the
+model you are running**; the defaults are `gpt-6-luna`'s — $0.10 per million in,
+$0.01 cached, $0.50 out. Cache *writes* ($0.125/M) are not reported by the API,
+so they are missing from the estimate and the real bill runs slightly higher.
+
+Measured on real missions with `gpt-4.1-mini` at 320×240: about 8 seconds per
+step, nearly all of it model latency rather than the robot. With low detail a
+picture costs roughly 85 tokens instead of several hundred.
+
+## Testing
+
+```bash
+python test_agent.py
+```
+
+Runs three scripted missions against a stub model and a fake robot whose view
+changes as it drives: no key, no hardware. It checks the tool handling, the
+image pruning, the dead reckoning, the memory file, the "same view" skip and the
+stuck escape (28 checks).

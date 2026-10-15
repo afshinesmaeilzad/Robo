@@ -36,7 +36,8 @@ Commands come first: they travel over one always-open WebSocket as tiny messages
 9. [API](#9-api)
 10. [Customizing](#10-customizing)
 11. [Troubleshooting](#11-troubleshooting)
-12. [Project structure](#12-project-structure)
+12. [AI explorer](#12-ai-explorer-server)
+13. [Project structure](#13-project-structure)
 
 ---
 
@@ -52,6 +53,8 @@ Commands come first: they travel over one always-open WebSocket as tiny messages
 | AA battery holder, 4× (6V) | 1 | Motor power |
 | AA battery holder, 4× (6V), or a USB power bank | 1 | ESP32-CAM power |
 | Jumper wires / breadboard | | |
+| HC-SR04 ultrasonic range finder | 1 | Optional: sees obstacles the camera cannot |
+| 1 kΩ and 2 kΩ resistors | 1 each | Optional: divider for the sensor's 5 V ECHO pin |
 
 ---
 
@@ -116,6 +119,60 @@ About the voltages:
 | L293D pins **4, 5, 12, 13** | GND | |
 | ESP32 pack **+** (4×AA or power bank) | ESP32-CAM **5V** | ESP32 supply |
 | Motor pack **−**, ESP32 pack **−**, ESP32-CAM **GND** | Common GND | **Required** |
+
+### Optional: HC-SR04 range finder
+
+The camera cannot see anything closer than about 30 cm, or anything low in front
+of the wheels. A £2 ultrasonic sensor covers exactly that gap.
+
+The header brings out only 5V, GND, IO12–15, IO2, IO4, IO16, IO0 and the serial
+pins. The motors take 12–15, IO0 is the camera clock and IO16 is the PSRAM chip
+select, so **IO2 and IO4** are all that is left. (GPIO 33 exists on the chip but
+is not on the header — it drives the little red LED.)
+
+IO4 is the flash LED, and the sensor shares it. Both still work:
+
+- **Ranging does not light the LED.** A trigger pulse is 10 µs, ten times a
+  second — 0.01% duty, far too brief to see.
+- **The flash still works.** While it is deliberately lit, ranging pauses; the
+  robot reports `sonarpaused` and tells the driver "paused while the light is on"
+  rather than quietly going blind. Leave the Light **off** while driving and you
+  have distances the whole time.
+
+| HC-SR04 | ESP32-CAM | Note |
+|---|---|---|
+| VCC | 5V | needs 5 V; see the warning below |
+| GND | GND | |
+| TRIG | **GPIO 4** | shared with the flash LED |
+| ECHO | **GPIO 2**, through a divider | 1 kΩ in series, 2 kΩ to GND |
+
+```
+ ECHO ──[1k]──┬── GPIO 2
+              │
+            [2k]
+              │
+             GND
+```
+
+The divider turns the sensor's 5 V echo into 5 × 2/(1+2) = **3.3 V**, which the
+ESP32 can take. Putting the 2 kΩ in series instead gives 1.7 V, too low to read
+as HIGH.
+
+> **Power:** the HC-SR04 wants 5 V and tolerates about 5.5 V. From a 4×AA pack
+> (~6 V) put a **1N4007 diode in series** with its VCC, stripe towards the
+> sensor, to drop ~0.7 V. From a USB power bank's 5 V it can be wired directly.
+
+The robot pings ten times a second. Closer than **20 cm** it refuses to drive
+forward at all — turning and reversing still work, because that is how it gets
+out — and it stops the wheels immediately if something appears while it is
+moving. `/info` reports `dist`, `blocked` and `sonar`, the dashboard shows the
+reading, and the AI driver is told the distance after every move.
+
+With no sensor fitted nothing changes: the pings get no echo, and the robot
+drives exactly as before.
+
+To check the wiring, connect USB and send **`d`** in the serial monitor: it
+prints ten readings.
 
 ### How a motor is driven
 
@@ -438,7 +495,47 @@ s->set_hmirror(s, 1);
 
 ---
 
-## 12. Project structure
+## 12. AI explorer (`server/`)
+
+An optional server that lets an OpenAI vision model drive the robot: it looks
+through the camera, explores the room, avoids obstacles and remembers what it
+finds. The server keeps the robot's estimated position (dead reckoning from the
+commands it sent) and its memory of earlier runs, so the model can plan several
+moves from one picture instead of looking after every step.
+
+There are two kinds of mission. When **exploring and mapping**, the server
+fingerprints each picture locally (a difference hash plus a colour histogram) and
+never sends an unchanged view twice — the model is told in one line of text —
+while a familiar place arrives with the notes made there, which keeps the token
+bill and the WiFi traffic down. When **finding or following a target**, every
+picture is sent in full, because the target moves and small changes are the whole
+point. The mode is chosen on the dashboard, or read from the wording of the goal.
+
+The same fingerprints catch a stuck robot: if the view does not change after a
+move, the wheels are blocked, so the server backs it out, turns it and tells the
+model to try another way.
+
+To put the robot on your home network instead of it making its own, fill in
+`HOME_SSID` and `HOME_PASS` at the top of `robo_wifi/robo_wifi.ino`. The server
+then reaches the robot and the internet at once, and finds it by itself with
+`ROBOT_HOST=auto`. If the robot cannot join, it falls back to its own `Robo-CAM`
+network.
+
+Your API key lives in `server/.env`, which git ignores, and is passed to the
+container at run time — it is never committed or baked into the image.
+
+```bash
+cp server/.env.example server/.env   # paste your key
+cd server && docker compose up --build
+```
+
+Then open http://localhost:8000. Set `ROBOT_HOST=fake` to try it with no
+hardware. Full details, including calibration and cost, are in
+[server/README.md](server/README.md).
+
+---
+
+## 13. Project structure
 
 ```
 Robo/
@@ -447,6 +544,15 @@ Robo/
 │   └── motor_test.ino      step 1: wiring and motor test (serial control)
 ├── robo_wifi/
 │   └── robo_wifi.ino       step 2: WiFi access point + control + pictures
-└── tools/
-    └── robo_test.js        link test: command delay, drops, picture delivery
+├── tools/
+│   └── robo_test.js        link test: command delay, drops, picture delivery
+└── server/                 optional: GPT-4.1 explores the room
+    ├── app.py              FastAPI server and dashboard
+    ├── agent.py            the model's tools and the mission loop
+    ├── robot.py            drive commands (ws) and pictures (/jpg), dead reckoning
+    ├── memory.py           notes and snapshots that survive between runs
+    ├── vision_index.py     local picture fingerprints: is this view new?
+    ├── discover.py         finds the robot on the network
+    ├── test_agent.py       offline check: stub model, fake robot
+    └── docker-compose.yml  runs it, reading the key from .env
 ```

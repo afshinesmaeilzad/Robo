@@ -1,0 +1,13 @@
+services:
+  brain:
+    build: .
+    # The key is read at run time from server/.env, which git ignores.
+    # It is never copied into the image.
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

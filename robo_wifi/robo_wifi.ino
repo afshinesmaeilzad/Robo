@@ -14,6 +14,8 @@
 #include "img_converters.h"
 #include "esp_http_server.h"
 #include "esp_wifi.h"
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include "esp_attr.h"
 #include "lwip/sockets.h"
 #include "soc/soc.h"
@@ -21,6 +23,22 @@
 
 const char *AP_SSID = "Robo-CAM";
 const char *AP_PASS = "robo12345";
+
+// Optional: put your home network here and the robot joins it instead of making
+// its own, so one computer can reach both the robot and the internet (see
+// server/). Leave HOME_SSID empty to keep the robot's own "Robo-CAM" network.
+// If it cannot join within JOIN_TIMEOUT_MS it makes its own network anyway, so
+// a wrong password or a router that is off never locks you out.
+#define HOME_SSID "iPhone"
+#define HOME_PASS "afshines1371"
+const uint32_t JOIN_TIMEOUT_MS = 15000;
+// After falling back to our own network, try the home network again this often.
+// A phone hotspot comes and goes (and drops to 5 GHz, which this chip cannot
+// see), so the robot should rejoin by itself rather than need a reset.
+const uint32_t REJOIN_EVERY_MS = 20000;
+// If the home network goes away under us (the hotspot restarts, or drops to
+// 5 GHz), try quietly for this long before giving up and making our own again.
+const uint32_t RECONNECT_PATIENCE_MS = 45000;
 
 // Full transmit power: a solid link matters more than battery life. Lower
 // values (8.5 and 13 dBm) were tried to save current and made the link slow
@@ -33,6 +51,31 @@ const int LEFT_IN2  = 15;
 const int RIGHT_IN1 = 13;
 const int RIGHT_IN2 = 12;
 const int FLASH_LED = 4;
+
+// HC-SR04 ultrasonic range finder, optional: it sees the things the camera
+// cannot, which is everything closer than about 30 cm and below its view.
+// The AI-Thinker header only brings out 5V, GND, IO12-15, IO2, IO4, IO16, IO0
+// and the serial pins. The motors take 12-15, IO0 is the camera clock and IO16
+// is the PSRAM chip select, so IO2 and IO4 are all that is left.
+// TRIG therefore shares IO4 with the flash LED: a trigger pulse is 10 us, far
+// too short to light it, and ranging pauses while the flash is deliberately on.
+// ECHO is 5 V, so it comes in through a divider: 1k in series, 2k to ground.
+const int TRIG_PIN = 4;   // shared with FLASH_LED
+const int ECHO_PIN = 2;
+// The trigger shares the flash LED's pin, and that LED is bright enough that
+// even a 10 us pulse shows as a faint blink. So ping ten times a second only
+// while actually driving forward, where it is a safety matter, and once a
+// second otherwise just to keep /info honest.
+const uint32_t PING_EVERY_MS = 100;
+const uint32_t PING_IDLE_MS = 1000;
+// How close the robot may drive before it refuses to go forward. Normally 20 cm;
+// the server lowers it briefly (/set?stopcm=) when it means to touch something,
+// such as nudging a toy it was asked to push.
+volatile int stopCm = 20;
+const int STOP_CM_MIN = 4;
+const int STOP_CM_MAX = 80;
+const int CLOSE_CM = 45;  // "something is coming up" for the driver
+const uint32_t PING_TIMEOUT_US = 25000;  // ~4 m, the sensor's limit
 
 // LEDC channels 2-5 (timers 1-2); the camera uses channel 0 / timer 0 for XCLK
 const int PWM_FREQ = 1000;
@@ -49,6 +92,14 @@ const int RAMP_STEP = 20;
 
 // Frames thrown away before a picture (the buffered one is stale)
 const int CAM_WARMUP_FRAMES = 2;
+
+// Flash: in the dark the camera sees nothing useful, so the LED is switched on
+// for the picture and off again. Brightness is 0-255, measured from the picture
+// the robot just took; below DARK_BELOW the flash is used.
+// 0 = auto (dark pictures only), 1 = always, 2 = never.
+volatile int flashMode = 0;
+const int DARK_BELOW = 55;
+const int FLASH_SETTLE_FRAMES = 3;  // frames to let exposure adjust to the light
 
 // AI-Thinker ESP32-CAM camera pins
 #define PWDN_GPIO_NUM  32
@@ -73,6 +124,10 @@ volatile uint32_t lastCmdMs = 0;
 volatile int targetLeft = 0, targetRight = 0;  // set by commands
 int curLeft = 0, curRight = 0;                 // applied by loop() with ramp
 volatile int wsFd = -1;                        // socket of the driving WebSocket
+volatile int distanceCm = -1;                  // -1 = nothing measured (no echo, or no sensor)
+volatile bool sonarSeen = false;               // has the sensor ever answered?
+volatile bool blockedAhead = false;            // too close to drive forward
+volatile bool flashOn = false;                 // flash LED lit: shares the trigger pin
 
 // Pictures
 bool camReady = false;
@@ -88,6 +143,11 @@ volatile uint32_t picSent = 0, picFailed = 0, lastPicBytes = 0, lastPicMs = 0;
 RTC_NOINIT_ATTR uint32_t bootMagic;
 RTC_NOINIT_ATTR uint32_t bootCount;
 int apChannel = 1;
+bool joinedHome = false;
+volatile bool otaRunning = false;      // pause everything else while flashing
+volatile bool lastUsedFlash = false;
+volatile int lastBrightness = -1;
+const char *MDNS_NAME = "robo";  // http://robo.local
 
 httpd_handle_t server = NULL;
 
@@ -118,8 +178,18 @@ void updateMotors() {
   if (r != curRight) { curRight = r; setMotor(RIGHT_IN1, RIGHT_IN2, r); }
 }
 
+// Forward means both wheels forward: a spin (one each way) is always allowed,
+// since turning away is how the robot gets out of trouble.
+static bool isForward(const char *d) {
+  return !strcmp(d, "f") || !strcmp(d, "fl") || !strcmp(d, "fr");
+}
+
 void applyDirection(const char *d) {
   lastCmdMs = millis();  // before the targets, so loop() never sees a new target with an old time
+  if (blockedAhead && isForward(d)) {
+    drive(0, 0);  // something is within STOP_CM: back up or turn instead
+    return;
+  }
   int s = speed;
   int h = s / 3;  // inner wheel speed on curves
   if      (!strcmp(d, "f"))  drive(s, s);
@@ -166,6 +236,9 @@ select,button.b{background:#333;color:#eee;border:0;border-radius:6px;padding:6p
     <option value="1">1</option><option value="2">2</option><option value="5" selected>5</option><option value="10">10</option><option value="15">15</option><option value="25">max</option>
   </select></label>
   <button class="b" id="snap">📷 Take picture</button>
+  <label>Flash <select id="flash">
+    <option value="auto" selected>auto (dark only)</option><option value="on">always</option><option value="off">never</option>
+  </select></label>
   <label>Size <select id="res">
     <option value="qqvga">160x120</option><option value="qvga" selected>320x240</option><option value="vga">640x480</option>
   </select></label>
@@ -298,10 +371,51 @@ setInterval(health, 10000);
 
 document.getElementById('spd').onchange = e => fetch('/set?speed=' + e.target.value);
 document.getElementById('res').onchange = e => fetch('/set?size=' + e.target.value);
+document.getElementById('flash').onchange = e => fetch('/set?flash=' + e.target.value);
 document.getElementById('fps').onchange = e => fetch('/set?fps=' + e.target.value);
 let led = 0;
 document.getElementById('led').onclick = () => { led ^= 1; fetch('/set?led=' + led); };
 </script></body></html>)HTML";
+
+// ---------- distance ----------
+
+// One ping, in centimetres, or -1 if nothing came back. Sound covers 58 us per
+// centimetre there and back.
+int measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long us = pulseIn(ECHO_PIN, HIGH, PING_TIMEOUT_US);
+  if (us == 0) return -1;  // no echo: out of range, too soft, or no sensor fitted
+  int cm = us / 58;
+  return (cm < 2 || cm > 400) ? -1 : cm;  // outside the sensor's honest range
+}
+
+// Called from loop(): measure, and stop the wheels if we are about to hit something
+void updateDistance() {
+  static uint32_t lastPing = 0;
+  // The trigger pin is the LED pin: while the light is deliberately on, the
+  // robot cannot range. It also must not keep an old reading and pretend.
+  if (flashOn) {
+    distanceCm = -1;
+    blockedAhead = false;
+    return;
+  }
+  bool goingForward = targetLeft > 0 && targetRight > 0;
+  if (millis() - lastPing < (goingForward ? PING_EVERY_MS : PING_IDLE_MS)) return;
+  lastPing = millis();
+  int cm = measureDistance();
+  distanceCm = cm;
+  if (cm > 0) sonarSeen = true;
+  bool tooClose = (cm > 0 && cm < stopCm);
+  blockedAhead = tooClose;
+  if (tooClose && targetLeft > 0 && targetRight > 0) {
+    drive(0, 0);  // stop now; the camera would not have seen this
+    Serial.printf("[%lu ms] obstacle %d cm ahead: stopped\n", millis(), cm);
+  }
+}
 
 // ---------- camera ----------
 
@@ -331,7 +445,27 @@ static camera_fb_t *camCapture(int warmup) {
       esp_camera_fb_return(fb);
     }
   }
-  return esp_camera_fb_get();
+  camera_fb_t *fb = esp_camera_fb_get();
+  lastUsedFlash = false;
+  if (!fb || flashMode == 2) return fb;  // no picture, or flash switched off
+
+  lastBrightness = jpegBrightness(fb);
+  if (flashMode == 1 || (flashMode == 0 && lastBrightness >= 0 && lastBrightness < DARK_BELOW)) {
+    esp_camera_fb_return(fb);
+    flashOn = true;
+    digitalWrite(FLASH_LED, HIGH);
+    // The first frames are still exposed for the dark: let the camera catch up
+    for (int i = 0; i < FLASH_SETTLE_FRAMES; i++) {
+      camera_fb_t *warm = esp_camera_fb_get();
+      if (warm) esp_camera_fb_return(warm);
+    }
+    fb = esp_camera_fb_get();
+    digitalWrite(FLASH_LED, LOW);
+    flashOn = false;
+    lastUsedFlash = true;
+    if (fb) lastBrightness = jpegBrightness(fb);
+  }
+  return fb;
 }
 
 static void camRelease() {
@@ -538,8 +672,18 @@ static esp_err_t goHandler(httpd_req_t *req) {
 static esp_err_t setHandler(httpd_req_t *req) {
   char v[12];
   if (queryParam(req, "speed", v, sizeof(v))) speed = constrain(atoi(v), 0, 255);
-  if (queryParam(req, "led", v, sizeof(v)))   digitalWrite(FLASH_LED, atoi(v) ? HIGH : LOW);
+  if (queryParam(req, "led", v, sizeof(v))) {
+    flashOn = atoi(v) != 0;
+    digitalWrite(FLASH_LED, flashOn ? HIGH : LOW);
+  }
+  if (queryParam(req, "flash", v, sizeof(v))) {
+    if (!strcmp(v, "auto")) flashMode = 0;
+    else if (!strcmp(v, "on")) flashMode = 1;
+    else if (!strcmp(v, "off")) flashMode = 2;
+  }
   if (queryParam(req, "fps", v, sizeof(v)))   streamFps = constrain(atoi(v), 1, 25);
+  if (queryParam(req, "stopcm", v, sizeof(v)))
+    stopCm = constrain(atoi(v), STOP_CM_MIN, STOP_CM_MAX);
   if (queryParam(req, "size", v, sizeof(v))) {
     // Applied at the next picture, while the camera is awake
     if (!strcmp(v, "qqvga")) wantSize = FRAMESIZE_QQVGA;
@@ -566,16 +710,24 @@ static const char *resetReason() {
 // Robot health for the page: uptime, restarts, signal strength, picture stats
 static esp_err_t infoHandler(httpd_req_t *req) {
   int rssi = 0;
-  wifi_sta_list_t sta;
-  if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) rssi = sta.sta[0].rssi;
-  char out[256];
+  if (joinedHome) {
+    rssi = WiFi.RSSI();  // our signal from the router
+  } else {
+    wifi_sta_list_t sta;
+    if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) rssi = sta.sta[0].rssi;
+  }
+  char out[420];  // grows every time a field is added; truncation is silent
   snprintf(out, sizeof(out),
            "{\"up\":%lu,\"boots\":%lu,\"reset\":\"%s\",\"ch\":%d,\"rssi\":%d,\"clients\":%d,\"heap\":%lu,"
-           "\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,\"picms\":%lu}",
+           "\"home\":%d,\"cam\":%d,\"video\":%d,\"fps\":%d,\"pics\":%lu,\"picfail\":%lu,\"picbytes\":%lu,"
+           "\"picms\":%lu,\"flash\":%d,\"usedflash\":%d,\"bright\":%d,"
+           "\"dist\":%d,\"blocked\":%d,\"sonar\":%d,\"sonarpaused\":%d,\"stopcm\":%d}",
            (unsigned long)(millis() / 1000), (unsigned long)bootCount, resetReason(), apChannel,
            rssi, WiFi.softAPgetStationNum(), (unsigned long)ESP.getMinFreeHeap(),
-           camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
-           (unsigned long)lastPicBytes, (unsigned long)lastPicMs);
+           joinedHome ? 1 : 0, camReady ? 1 : 0, streaming ? 1 : 0, streamFps, (unsigned long)picSent, (unsigned long)picFailed,
+           (unsigned long)lastPicBytes, (unsigned long)lastPicMs,
+           flashMode, lastUsedFlash ? 1 : 0, lastBrightness,
+           distanceCm, blockedAhead ? 1 : 0, sonarSeen ? 1 : 0, flashOn ? 1 : 0, stopCm);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_sendstr(req, out);
@@ -658,6 +810,131 @@ int pickChannel() {
   return cand[best];
 }
 
+// Join the home network if one is configured, otherwise (or on failure) make
+// our own. mDNS gives the robot a name, so its address doesn't have to be hunted.
+void startWiFi() {
+  WiFi.setSleep(false);
+  if (strlen(HOME_SSID) > 0) {
+    Serial.printf("Joining WiFi \"%s\" ...\n", HOME_SSID);
+    WiFi.mode(WIFI_STA);
+    // Look for it first: the ESP32 is 2.4 GHz only, so a 5 GHz-only network
+    // (an iPhone hotspot without "Maximize Compatibility") is simply invisible.
+    int found = WiFi.scanNetworks();
+    bool visible = false;
+    for (int i = 0; i < found; i++)
+      if (WiFi.SSID(i) == HOME_SSID) {
+        visible = true;
+        Serial.printf("  found \"%s\": channel %d, signal %d dBm, %s\n", HOME_SSID,
+                      WiFi.channel(i), WiFi.RSSI(i),
+                      WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "password");
+      }
+    if (!visible)
+      Serial.printf("  \"%s\" is not in range on 2.4 GHz (%d networks seen). An iPhone "
+                    "hotspot needs \"Maximize Compatibility\" switched on.\n", HOME_SSID, found);
+    WiFi.scanDelete();
+    WiFi.begin(HOME_SSID, HOME_PASS);
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < JOIN_TIMEOUT_MS) delay(200);
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.setTxPower(WIFI_TX_POWER);
+      apChannel = WiFi.channel();
+      joinedHome = true;
+      Serial.printf("Joined \"%s\" on channel %d  ->  http://%s  (or http://%s.local)\n",
+                    HOME_SSID, apChannel, WiFi.localIP().toString().c_str(), MDNS_NAME);
+      if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+      startOTA();
+      return;
+    }
+    switch (WiFi.status()) {
+      case WL_NO_SSID_AVAIL:
+        Serial.println("  network not found (wrong name, out of range, or 5 GHz only)"); break;
+      case WL_CONNECT_FAILED:
+        Serial.println("  refused: check the password"); break;
+      default:
+        Serial.printf("  gave up waiting (status %d)\n", WiFi.status());
+    }
+    Serial.println("Could not join; making our own network instead.");
+    WiFi.disconnect(true);
+  }
+  apChannel = pickChannel();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS, apChannel);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_TX_POWER);
+  Serial.printf("WiFi AP \"%s\" / \"%s\" on channel %d  ->  http://%s\n", AP_SSID, AP_PASS, apChannel,
+                WiFi.softAPIP().toString().c_str());
+  if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+  startOTA();
+}
+
+// While running on our own network with nobody connected, keep an eye out for
+// the home network coming back.
+void retryHomeWiFi() {
+  static uint32_t lastTry = 0;
+  if (joinedHome || strlen(HOME_SSID) == 0) return;
+  if (WiFi.softAPgetStationNum() > 0) return;  // somebody is driving: leave it alone
+  if (millis() - lastTry < REJOIN_EVERY_MS) return;
+  lastTry = millis();
+  int n = WiFi.scanNetworks();
+  bool visible = false;
+  for (int i = 0; i < n; i++)
+    if (WiFi.SSID(i) == HOME_SSID) visible = true;
+  WiFi.scanDelete();
+  if (!visible) return;  // still not there; stay on our own network
+  Serial.printf("[%lu ms] \"%s\" is back: joining it\n", millis(), HOME_SSID);
+  httpd_stop(server);
+  server = NULL;
+  WiFi.softAPdisconnect(true);
+  startWiFi();
+  startServer();
+}
+
+// Flashing over WiFi: the board lives on the robot, and taking it off to plug
+// in USB is how a five-minute change becomes a twenty-minute one.
+void startOTA() {
+  ArduinoOTA.setHostname(MDNS_NAME);
+  ArduinoOTA.onStart([]() {
+    drive(0, 0);                       // wheels off before anything else
+    setMotor(LEFT_IN1, LEFT_IN2, 0);
+    setMotor(RIGHT_IN1, RIGHT_IN2, 0);
+    otaRunning = true;
+    Serial.println("OTA update starting");
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA done; restarting"); });
+  ArduinoOTA.onError([](ota_error_t e) {
+    otaRunning = false;
+    Serial.printf("OTA failed (%u)\n", e);
+  });
+  ArduinoOTA.begin();
+}
+
+// Keep the home network. A hotspot that restarts drops every client, and sitting
+// in STA mode disconnected forever is no use to anybody.
+void holdHomeWiFi() {
+  static uint32_t lostSince = 0;
+  static uint32_t lastTry = 0;
+  if (!joinedHome) return;
+  if (WiFi.status() == WL_CONNECTED) { lostSince = 0; return; }
+  uint32_t now = millis();
+  if (lostSince == 0) {
+    lostSince = now;
+    Serial.printf("[%lu ms] lost \"%s\"; trying to get it back\n", now, HOME_SSID);
+  }
+  if (now - lastTry > 5000) {
+    lastTry = now;
+    WiFi.reconnect();
+  }
+  if (now - lostSince > RECONNECT_PATIENCE_MS) {
+    Serial.println("still no home network: making our own instead");
+    joinedHome = false;
+    lostSince = 0;
+    httpd_stop(server);
+    server = NULL;
+    startWiFi();
+    startServer();
+  }
+}
+
 // ---------- main ----------
 
 void setup() {
@@ -668,6 +945,9 @@ void setup() {
   Serial.printf("Boot: reset reason %s, restarts since power-on %lu\n", resetReason(), (unsigned long)bootCount);
   pinMode(FLASH_LED, OUTPUT);
   digitalWrite(FLASH_LED, LOW);
+  pinMode(TRIG_PIN, OUTPUT);   // same pin as the flash LED
+  digitalWrite(TRIG_PIN, LOW);
+  pinMode(ECHO_PIN, INPUT);
 
   camLock = xSemaphoreCreateMutex();
   camReady = initCamera();
@@ -679,13 +959,7 @@ void setup() {
   setMotor(LEFT_IN1, LEFT_IN2, 0);
   setMotor(RIGHT_IN1, RIGHT_IN2, 0);
 
-  apChannel = pickChannel();
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS, apChannel);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_TX_POWER);
-  Serial.printf("WiFi AP \"%s\" / \"%s\" on channel %d  ->  http://%s\n", AP_SSID, AP_PASS, apChannel,
-                WiFi.softAPIP().toString().c_str());
+  startWiFi();
 
   startServer();
   if (camReady)
@@ -729,8 +1003,28 @@ void cameraSelfTest() {
   warmupLog = false;
 }
 
+// Serial "d": ten readings, to check the sensor and its wiring
+void distanceSelfTest() {
+  Serial.println("Distance test: 10 readings");
+  for (int i = 0; i < 10; i++) {
+    int cm = measureDistance();
+    if (cm > 0) Serial.printf("  %d cm\n", cm);
+    else Serial.println("  no echo (out of range, or check TRIG/ECHO wiring and 5V)");
+    delay(300);
+  }
+}
+
 void loop() {
-  if (Serial.available() && Serial.read() == 'p') cameraSelfTest();
+  ArduinoOTA.handle();
+  if (otaRunning) { delay(5); return; }  // nothing else matters mid-update
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'p') cameraSelfTest();
+    if (c == 'd') distanceSelfTest();
+  }
+  updateDistance();
+  holdHomeWiFi();
+  retryHomeWiFi();
   // Read in reverse of the write order (time, then targets) since commands arrive on another core
   bool active = targetLeft || targetRight;
   uint32_t last = lastCmdMs;
